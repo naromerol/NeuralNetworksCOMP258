@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score
 
 class Basic_Perceptron:
     """
-    Perceptron base class to implement AND logic gate
+    Perceptron base class for exercise 1
     """
     #DEBUG LEVELS
     NONE = 0
@@ -31,6 +31,11 @@ class Basic_Perceptron:
         self.learning_rate = learning_rate
 
     def train(self, input_values, expected, activation_type='step'):
+        '''
+        This method predicts a value given the inputs
+        Adjusts the weights and bias according to the difference between
+        actual and predicted values
+        '''
         self.input_values = input_values
         predicted = self.predict(self.input_values, activation_type)
 
@@ -40,14 +45,16 @@ class Basic_Perceptron:
         if(predicted != expected):
             #Calculate difference in results
             diff = expected - predicted
-            
+
             for i in range(self.num_inputs):
                 self.weights[i] += diff * input_values[i]
                 self.bias += diff
 
     def predict(self, input_values, activation_type='step'):
+        '''
+        This method calculates the values given a set of inputs given the current weights of the perceptron
+        '''
         # calculate the weighted sum
-        
         weighted_sum = np.dot(input_values, self.weights) + self.bias
         result = self.calculate_activation(weighted_sum, activation_type)
         if self.debug_level >= Basic_Perceptron.PREDICT:
@@ -55,15 +62,25 @@ class Basic_Perceptron:
         return result
 
     def calculate_activation(self, wsum, type='Step'):
+        '''
+        This method encapsulates the activation function of the perceptron
+        '''
         if(type.lower() == 'step'):
             if(wsum >= 1):
                 return 1
             return 0
         if(type.lower() == 'sigmoid'):
-            return 1.0/(1.0+np.exp(-wsum))
+            aux_val = 1.0/(1.0+np.exp(-wsum))
+            if( aux_val > 0.6):
+                return 1
+            return 0
         return 0
     
     def simulate_train_data(self, num_iters):
+        '''
+        This method simulates AND entries for the perceptron
+        The numer of training iterations is received as parameter
+        '''
         num_iterations = 10
         for _ in range(num_iterations):
             x1 = np.random.randint(2,size=1)[0]
@@ -84,7 +101,7 @@ print('\n\nPART 1A. ANG LOGIC GATE')
 and_p = Basic_Perceptron(2, debug_level=Basic_Perceptron.TRAINING)
 
 #Train the perceptron
-num_iters = 10
+num_iters = 100
 print('TRAINING PHASE')
 and_p.simulate_train_data(num_iters)
 
@@ -103,7 +120,7 @@ print(f'Accuracy: {accuracy} for {num_iters} training iterations')
 
 """
 RESULTS EXERCISE 1A: 
-Generally an accuracy of 75% was achieved but it is quite bad given the exercise and a high chance of a zero (False) value
+Generally low values and a high accuracy of 0.75 was achieved. This behavior is very poor given the exercise objectives and a high chance of false positives
 The regular perceptron lerning rule makes it difficult to estabilize the right weights
 """
 
@@ -141,11 +158,14 @@ y_raw = data_prepared[data_prepared.columns[-1]]
 
 #Codify classes in 0 and 1
 y = lbl_encoder.transform(y_raw)
-#PSlit data in train and test
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=301133331)
 
-iris_p = Basic_Perceptron(4, debug_level=Basic_Perceptron.NONE)
+#Split data in train and test
+# X_train, X_test, y_train, y_test = train_test_split(
+#     X, y, test_size=0.2, random_state=301133331)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2)
+
+iris_p = Basic_Perceptron(4, debug_level=Basic_Perceptron.PREDICT)
 y_pred = np.zeros(len(y_test))
 
 print('\n\nTRAINING PHASE')
@@ -158,3 +178,9 @@ for index in range(len(X_test)):
 
 accuracy = accuracy_score(y_test,y_pred)
 print(f'Accuracy for iris data: {accuracy}')
+
+"""
+RESULTS EXERCISE 1B: 
+In the experiments no high accuracy was obtained. Even with random selection of train and test sets the accuracy never
+rose to acceptable levels given the dataset underlying structure (~ 0.6)
+"""
