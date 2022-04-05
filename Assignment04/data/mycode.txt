@@ -1,0 +1,980 @@
+import os
+import pandas as pd
+from Bicycle_theft_Group_3_section_2COMP247Project_Plots import bicycle_plots
+
+#pd.set_option("display.max_columns",35)
+#pd.set_option('display.max_rows', 50)
+#pd.set_option('display.width', 100)
+
+#os.chdir(os.path.dirname(os.path.abspath(__file__)))
+project_folder = os.getcwd();
+dataset_file = 'Bicycle_Thefts.csv'
+dataset_full_path = os.path.join(project_folder, dataset_file)
+print('Reading dataset file from: ', dataset_full_path)
+bicycle_df = pd.read_csv(dataset_full_path,low_memory=False)
+
+#
+#
+#PLOTTING AUXILIARY CLASS
+#  >> Uncomment this function to invoke plotting aux file
+#bicycle_plots(bicycle_df)
+#
+#
+
+#INITIAL DATA EXPLORATION
+'''
+bicycle_df.shape
+bicycle_df.head()
+bicycle_df.info()
+bicycle_df.describe()
+bicycle_df.dtypes
+bicycle_df.columns
+'''
+
+#Status variable selected as label
+bicycle_df['Status'].value_counts()
+bicycle_df['Status'].count()
+
+#Missing and null values
+isna_df = bicycle_df.isna().sum()
+isna_df[isna_df>0]
+isnull_df = bicycle_df.isnull().sum()
+isnull_df[isnull_df>0]
+
+#REMOVE COLUMNS INITIALLY DETECTED AS UNNECESSARY
+bicycle_df.drop(columns=['X', 'Y','OBJECTID','event_unique_id','ObjectId2'], axis=1, inplace=True)
+
+#MISSING VALUES
+# Numerical  > Mean, Categorical > Mode
+bicycle_df['Cost_of_Bike'].fillna(bicycle_df['Cost_of_Bike'].mean(), inplace=True)
+bicycle_df['Bike_Model'].fillna(bicycle_df['Bike_Model'].mode()[0], inplace= True)
+bicycle_df["Bike_Make"].fillna(bicycle_df["Bike_Make"].mode()[0], inplace=True)
+bicycle_df["Bike_Colour"].fillna(bicycle_df["Bike_Make"].mode()[0], inplace=True)
+
+bicycle_df.isnull().sum()
+
+#HANDLING UNBALANCED CLASSES
+#-------------------------Handling imbalanced dataset---------------
+df_missing = bicycle_df
+df_missing['Status'].value_counts()
+
+df_missing['Status'] = [1 if b=='RECOVERED' else 0 for b in df_missing.Status]
+
+# Separate majority and minority classes
+df_majority = df_missing[df_missing.Status==0]
+df_minority = df_missing[df_missing.Status==1]
+ 
+# Upsample minority class
+from sklearn.utils import resample
+'''
+df_minority_upsampled = resample(df_minority, 
+                                 replace=True,     # sample with replacement
+                                 n_samples=25261,    # to match majority class
+                                 random_state=42) # reproducible results
+'''
+df_minority_upsampled = resample(df_minority, 
+                                 replace=True,     # sample with replacement
+                                 n_samples=25261,    # to match majority class
+                                 random_state=31) # reproducible results
+ 
+# Combine majority class with upsampled minority class
+df_upsampled = pd.concat([df_majority, df_minority_upsampled])
+ 
+# Display new class counts
+df_upsampled.Status.value_counts()
+
+#FULL DATA CORRELATION
+#corr_matrix = bicycle_df_encoded.corr()
+
+#FEATURE SELECTION
+from sklearn.feature_selection import RFE
+from sklearn.tree import DecisionTreeClassifier
+from sklearn import preprocessing
+'''
+Feature selection with OneHotEncoding (Preprocessing Pipeline)
+Takes a lot of time, we had to use LabelEncoding to get the selected columns
+
+We use LabelEncoding just for feature selection
+'''
+
+#Encoding
+le = preprocessing.LabelEncoder()
+bicycle_select = df_upsampled
+bicycle_select = bicycle_select.apply(lambda col: le.fit_transform(col.astype(str)), axis=0, result_type='expand')
+
+#Scaling
+cols = bicycle_select.columns
+min_max_scaler = preprocessing.MinMaxScaler()
+x_scaled = min_max_scaler.fit_transform(bicycle_select)
+bicycle_select = pd.DataFrame(x_scaled)
+bicycle_select.columns = cols
+
+rfe_selector = RFE(estimator=DecisionTreeClassifier(random_state=42))
+X_sel = bicycle_select.drop(columns=['Status'])
+y_sel = bicycle_select['Status']
+rfe_selector.fit(X_sel,y_sel)
+X_sel.columns[rfe_selector.get_support()]
+
+'''
+Initially found features
+
+Index(['Primary_Offence', 'Occurrence_Date', 'Occurrence_DayOfYear',
+       'Occurrence_Hour', 'Report_Date', 'Report_DayOfMonth', 'Report_Hour',
+       'Bike_Make', 'Bike_Model', 'Bike_Type', 'Bike_Speed', 'Cost_of_Bike',
+       'Longitude', 'Latitude'],
+      dtype='object')
+'''
+
+
+#PIPELINE DEFINITION
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+from sklearn.compose import ColumnTransformer
+
+#SPLIT CATEGORICAL AND NUMERIC DATA FOR EACH PIPELINE
+num_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='mean')),
+    ('scaler', StandardScaler())
+    ])
+
+cat_pipeline = Pipeline([
+    ('encoder', OneHotEncoder())
+    ])
+
+
+#UNIFIED PIPELINE FOR PREPROCESSING OVER UPSAMPLED DATA
+#Definitive features
+
+X = df_upsampled
+selected_features = ['Primary_Offence', 'Occurrence_DayOfYear',
+       'Occurrence_Hour', 'Report_DayOfMonth', 'Report_Hour',
+       'Bike_Make', 'Bike_Model', 'Bike_Type', 'Bike_Speed', 'Cost_of_Bike',
+       'Longitude', 'Latitude', 'Division', 'City', 'Hood_ID',
+       'NeighbourhoodName', 'Location_Type']
+
+#Remove unnecessary columns
+to_remove = []
+for f in X.columns:
+    if f not in selected_features:
+        to_remove.append(f)
+
+y = df_upsampled['Status']            
+X.drop(columns=to_remove, inplace=True)
+
+cat_cols = X.select_dtypes(include=['object']).columns
+num_cols =  X.select_dtypes(include=['int64', 'float64']).columns
+
+#Pipeline to join all preprocessing for numeric and categorical data
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('numeric',num_pipeline, num_cols),
+        ('categorical', cat_pipeline, cat_cols)]
+    )
+
+X_pp = preprocessor.fit_transform(X)
+
+
+#DATA SPLIT
+
+from sklearn.model_selection import train_test_split
+
+X_train, X_test, y_train, y_test = train_test_split(X_pp, y, test_size=0.30, random_state=100)
+
+
+'''
+from imblearn.over_sampling import SMOTE
+smote = SMOTE()
+X_train_smote, y_train_smote = smote.fit_resample(X_train.astype('float'),y_train)
+
+from collections import Counter
+print("Before SMOTE :" , Counter(y_train))
+print("After SMOTE :" , Counter(y_train_smote))
+'''
+
+#PREDICTIVE MODEL BUILDING
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import VotingClassifier
+#Metrics
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import precision_score
+from sklearn.metrics import recall_score
+from sklearn.metrics import f1_score
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import roc_curve, auc, plot_roc_curve
+
+#All parameter ranges have been reduced for testing
+'''
+COMPLETE CONFIGURATION
+
+lrc = LogisticRegression()
+
+lcr_params = {
+    'max_iter' : np.arange(1000,2100,500), #default 100
+    'C' : np.arange(0.1,1.1,0.3), #default 1
+              }
+
+rfc = RandomForestClassifier()
+rfc_params = {
+    'n_estimators' : np.arange(10,100,20), #default 100
+    'max_depth' : np.arange(10,100,20), #default 100
+    }
+
+svc = SVC()
+svc_params = {
+    'C' : np.arange(0.1,1.1,0.3) #default 1
+    }
+
+dtc = DecisionTreeClassifier(criterion='entropy')
+dtc_params = {
+    'max_depth' : np.arange(10,100,10) #default none
+    }
+
+etc = ExtraTreesClassifier()
+etc_params = {
+    'n_estimators' : np.arange(10,100,20), #default 100
+    'max_depth'  : np.arange(10,100,20) #default none
+    }
+
+mlp = MLPClassifier()
+mlp_params = {
+    'hidden_layer_sizes' : np.arange(10,100,20), #default 100
+    'learning_rate_init' : np.arange(0.001,0.01,0.003) #default 0.001
+    }
+'''
+
+lrc = LogisticRegression()
+lcr_params = {
+    'max_iter' : np.arange(1000,2000,500), #default 100
+    'C' : np.arange(0.1,1.0,0.5), #default 1
+              }
+
+rfc = RandomForestClassifier()
+rfc_params = {
+    'n_estimators' : np.arange(10,100,50), #default 100
+    'max_depth' : np.arange(10,100,50), #default 100
+    }
+
+svc = SVC()
+svc_params = {
+    'C' : np.arange(0.1,1.1,0.5) #default 1
+    }
+
+dtc = DecisionTreeClassifier(criterion='entropy')
+dtc_params = {
+    'max_depth' : np.arange(10,50,30) #default none
+    }
+
+etc = ExtraTreesClassifier()
+etc_params = {
+    'n_estimators' : np.arange(10,100,50), #default 100
+    'max_depth'  : np.arange(10,100,50) #default none
+    }
+
+mlp = MLPClassifier()
+mlp_params = {
+    'hidden_layer_sizes' : np.arange(10,100,50), #default 100
+    'learning_rate_init' : np.arange(0.001,0.01,0.005) #default 0.001
+    }
+
+models = { 
+    'lrc' : {'model': lrc, 'params' : lcr_params},
+    'rfc' : {'model': rfc, 'params' : rfc_params},
+    'svc' : {'model': svc, 'params' : svc_params},
+    'dtc' : {'model': dtc, 'params' : dtc_params},
+    'etc' : {'model': etc, 'params' : etc_params},
+    'mlp' : {'model': mlp, 'params' : mlp_params},
+          }
+
+#GRID SEARCH
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import KFold
+
+#Reduced splits for testing
+cv = KFold(n_splits=5, shuffle=True, random_state=31)
+
+print('\n\n#GRID SEARCH')
+for classifier in models:
+    cl = models[classifier]
+    print('\nGridSearch Analysis', cl['model'])
+    gs = GridSearchCV(cl['model'], cl['params'], cv=cv, 
+                      n_jobs=-1, verbose=2)
+    gs.fit(X_train, y_train)
+    gs_pred = gs.predict(X_test)
+    #Model scoring
+    accuracy = accuracy_score(y_test, gs_pred)
+    precision = precision_score(y_test, gs_pred)
+    recall = recall_score(y_test, gs_pred)
+    f1 = f1_score(y_test, gs_pred)
+    cm = confusion_matrix(y_test, gs_pred)
+    plot_roc_curve(gs, X_test, y_test, name=cl['model'])
+    plt.show()
+    
+    print(f'Accuracy: {accuracy}')
+    print(f'Precision: {precision}')
+    print(f'Recall: {recall}')
+    print(f'F1: {f1}')
+    print(f'Confusion Matrix: \n{cm}\n')
+    
+    print(classification_report(y_test, gs_pred))
+    
+    print('Best Parameters')
+    print(gs.best_params_)
+
+#RANDOMIZED GRID SEARCH
+from sklearn.model_selection import RandomizedSearchCV
+#Reduced splits for testing
+cv = KFold(n_splits=5, shuffle=True, random_state=31)
+
+print('\n\n#RANDOMIZED GRID SEARCH')
+
+for classifier in models:
+    cl = models[classifier]
+    print('\nRandomizedSearch Analysis', cl['model'])
+    rs = RandomizedSearchCV(cl['model'], cl['params'], cv=cv, 
+                      n_jobs=-1, verbose=2)
+    rs.fit(X_train, y_train)
+    rs_pred = rs.predict(X_test)
+    #Model scoring
+    accuracy = accuracy_score(y_test, rs_pred)
+    precision = precision_score(y_test, rs_pred)
+    recall = recall_score(y_test, rs_pred)
+    f1 = f1_score(y_test, rs_pred)
+    cm = confusion_matrix(y_test, rs_pred)
+    plot_roc_curve(rs, X_test, y_test, name=cl['model'])
+    plt.show()
+    
+    print(f'Accuracy: {accuracy}')
+    print(f'Precision: {precision}')
+    print(f'Recall: {recall}')
+    print(f'F1: {f1}')
+    print(f'Confusion Matrix: \n{cm}\n')
+    
+    print(classification_report(y_test, rs_pred))
+    
+    print('Best Parameters')
+    print(rs.best_params_)
+
+
+#BEST MODEL SELECTION
+
+sel_classifier = DecisionTreeClassifier(criterion='entropy', 
+                                   max_depth=40)
+
+
+sel_classifier.fit(X_train, y_train)
+sel_classifier_pred = sel_classifier.predict(X_test)
+
+#Model scoring
+accuracy = accuracy_score(y_test, sel_classifier_pred)
+precision = precision_score(y_test, sel_classifier_pred)
+recall = recall_score(y_test, sel_classifier_pred)
+f1 = f1_score(y_test, sel_classifier_pred)
+cm = confusion_matrix(y_test, sel_classifier_pred)
+plot_roc_curve(sel_classifier, X_test, y_test, name=cl['model'])
+plt.show()
+    
+print(f'Accuracy: {accuracy}')
+print(f'Precision: {precision}')
+print(f'Recall: {recall}')
+print(f'F1: {f1}')
+print(f'Confusion Matrix: \n{cm}')
+
+
+final_pipeline = Pipeline(steps=[
+        ('preprocess',preprocessor),
+        ('classifier',sel_classifier)
+        ])
+
+
+import pickle
+pickle.dump(final_pipeline, open('model.pkl','wb'))
+
+model = pickle.load(open('model.pkl','rb'))
+#model.fit(X_train, y_train)
+#dtc_predd = model.predict(X_test)
+
+'''
+Created by Narendra for COMP216 (March 2021)
+wk07_test_server.py
+
+A flask application to handle request for Test 1.
+Not meant for code inspection
+Might contain advanced coding
+'''
+
+# import urllib
+from flask import Flask, url_for, request, make_response
+import gzip, random
+
+fname_lst = ['Ritesh', 'Nusrat', 'Mintu', 'Sanchit', 'Santiago']
+lname_lst = ['Li', 'Shaw', 'Verma', 'Tahri', 'Gupta', 'Park']
+courses_lst = ['COMP100', 'COMP213', 'COMP120', 'COMP125', 'COMP123', 'COMP225']
+users = {
+    'arben': {
+        'fname': 'Arben',
+        'lname': 'Tapia',
+        'age': 56,
+        'courses' : ['COMP253','COMP305']
+    },
+    'narendra': {
+        'fname': 'Narendra',
+        'lname': 'Pershad',
+        'age': 45,
+        'courses' : ['COMP100','COMP216']
+
+    },
+    'ilia': {
+        'fname': 'Ilia',
+        'lname': 'Nika',
+        'age': 50,
+        'courses' : ['COMP304','COMP252']
+    },
+    'hao': {
+        'fname': 'Hao',
+        'lname': 'Lac',
+        'age': 40,
+        'courses' : ['COMP231','COMP228']
+    }
+}
+
+app = Flask(__name__)
+
+def create_user():
+    first = random.choice(fname_lst)
+    # result = dict()
+    # result[first.lower()] = { 
+    #     'fname': first, 'lname': random.choice(lname_lst), 
+    #     'age': random.randint(40, 60), 'courses': random.choices(courses_lst, k=random.randint(0,3))}
+    return (first.lower(), { 
+        'fname': first, 'lname': random.choice(lname_lst), 
+        'age': random.randint(40, 60), 'courses': random.choices(courses_lst, k=random.randint(0,3))})
+
+#question 5    
+@app.route('/ques5', methods=['DELETE', 'GET', 'HEAD', 'PATCH', 'POST', 'PUT', 'OPTIONS', 'TRACE'])
+def test5a():
+    '''
+    Returns some static text to the client
+    Check the server terminal for the request headers
+    '''
+    print(f'\nHeaders: \n{request.headers}') 
+    if request.method == 'GET':
+        return users
+    elif request.method == 'POST':
+        k, v = create_user()
+        users[k] = v 
+        return users
+    elif request.method == 'PUT':
+        return ', '.join(users.keys())
+    elif request.method == 'PATCH':
+        return ', '.join(users.keys())
+    elif request.method == 'DELETE':
+        k = random.choice(list(users.keys()))
+        return {k: users[k]}
+    else:
+        return request.method
+
+@app.route('/ques6', methods=['GET', 'POST'])
+def show_query_string_form_data():
+    '''
+    Returns the arguments that was sent by the request<br/>[browser sup only if query string supplied]
+    '''
+    if request.method == 'GET':
+        return request.args
+    elif request.method == 'POST':
+        return request.form
+        # return request.json
+
+@app.route('/ques6c')
+def show_user_agent():
+    '''
+    Returns all the users in the collection<br/>[browser sup]
+    '''
+    return str(request.user_agent)
+
+@app.route('/ques6d', methods=['GET', 'POST'])
+def compress_content():
+    '''
+    Sends compressed content to the client.
+
+    '''
+    data = b'Networking for Software Developers is the best course!!!'
+    # return gzip.compress(bytes(data.__str__(), 'utf8'))
+    return gzip.compress(data)
+
+@app.route('/ques6e', methods=['GET', 'POST'])
+def decompress_content():
+    '''
+    Sends un-compressed content to the client.
+
+    '''
+    print(f'{request.data}')
+    if request.data == b'':
+        return 'You need to send compress data to the server'
+    
+    return  gzip.decompress(request.data).decode("utf-8")
+
+if __name__ == '__main__':
+	app.run(debug=True)      #app.run(host, port, debug, options)
+
+
+# from types import resolve_bases
+from random import choice, randint
+from flask import Flask, url_for
+from flask import request, session
+from flask.helpers import make_response, send_file
+
+# from requests.sessions import session
+
+f_name = 'Abhi Alisha Amit Amrit Anosh Anuben Arielle Aritra Arpit Auraham Balachander Brandon Chadwick Chaitanya Christine Davut Devanshi Diego Dishank Divya Divyanshu Diwakar Dominic Gagandeep Gurleen Gurvir Harsh Heesoo Hitesh Huseyin Hussam Isaac Jashan Jefil Jiabao Joshua Kautuk Keval Keyurkumar Hung Krunal Luiz Mahmud Manpreet Maximino Shahzaman Mithil Nabil Amani Namirabanu Nestor Nidhi Nikhileswar Niyanta Nusrat Osman Prince Priti Rahul Riaz Robin Rozita Samridhi Shawn Shivam Shrikant Silviya Smit Sreelakshmi Yasmin Vaishali Viktoriia Vishal Wonsuk Xin Yi Xu-Tung'.split()
+l_name = 'Ahmed Ambarukhana Bindal Cha Coelho Corlu Mattos Dharmadhikari Duvvuru Ferdaus Ganguly Harding Jin Jitu Johar Mohan Kale Kalwachia Kamal Kansara Kaur Keshavala Kim Kumar Kuru Kweri Lakhan Lam Lapis Liao Lim Malek Malik Mandavia Martin Miroshnikov Mohamed Mueller Nair Narvaez Ommi Palepu Parmar Parvej Patel Phan Pushpan Riaz Rodrigues Romaniuk Romero Roy Sapkota Shah Sheladeeya Siddeshwar Siddhapura Singh Soleimani Tahir Timbol Trivedi Udavant Vandenbrande Velani Verma Yadav Yang'.split()
+programs = '3109 3402 3409 3419 3422 3429 3432 3469 3472 3508 3518 3528'.split()
+users = {
+    'ilia': {
+        'fname': 'Ilia',
+        'lname': 'Nika',
+        'age': 56
+    },
+    'narendra': {
+        'fname': 'Narendra',
+        'lname': 'Pershad',
+        'age': 45
+    },
+    'mehrdad': {
+        'fname': 'Mehrdad',
+        'lname': 'Tirandazian',
+        'age': 40
+    },
+    'mayy': {
+        'fname': 'Mayy',
+        'lname': 'Habayeb',
+        'age': 40
+    },
+    'vinay': {
+        'fname': 'Vinay',
+        'lname': 'Vaithilingam',
+        'age': 40
+    },
+    'hao': {
+        'fname': 'Hao',
+        'lname': 'Lac',
+        'age': 40
+    }
+}
+
+app = Flask(__name__)
+
+app.config['SECRET_KEY'] = 'super secret'           #this is needed for session
+
+def process_docstring(docs):
+    raw = docs.splitlines()              #split into lines
+    tok = [x.strip() for x in raw]       #remove leading and trailing spaces
+    tok = [x for x in tok if len(x) > 0] #remove empty tokens
+    result = tok[0] + '</a><br/>'        #first token will the part of the hyper link
+    for x in range(1, len(tok)):         #skip the first token
+        result += tok[x] + '<br/>'       #just add text to the result
+    return result +'</br>'
+
+@app.route('/')
+def index():
+    '''
+    The main landing page
+    Builds a lisk of all the routes published by this flask application
+    Appends the doc string to each route. The result is what you are seeing now!
+    '''
+    result = '<ol>'
+    for route in app.url_map.iter_rules():
+        if  route.endpoint != 'static':
+            result += f'<li> <a href="{route}">{process_docstring(eval(route.endpoint).__doc__)}' + '</li>'
+    return result + '</ol>'
+
+# @app.route('/a4_headers')    
+@app.route('/a4_headers')
+def headers():
+    '''
+    Returns some static text to the client
+    Check the server terminal for the request headers
+    '''
+    print(f'\n\nFrom the client:') 
+    print(f'{request.headers}') 
+    return 'Check the server terminal for the client headers'
+
+@app.route('/test1') 
+def test1():                                
+    '''
+    returns a single json object (dictionary) to the client<br/>[browser sup]
+    '''
+    return {'name': 'Narendra', 'course': 'COMP216', 'semester': 'Fall 2020'}
+
+@app.route('/a3_query_string')
+def query_strin():
+    '''
+    Returns the arguments that was sent by the request<br/>[browser sup only if query string supplied]
+    '''
+    return request.args
+
+@app.route('/a5_user_agents')
+def show_user_agent():
+    '''
+    Returns the user agent to the client
+    '''
+    # return str(request.user_agent)
+    print(f'\n\nClient user agent:') 
+    print(f'{request.user_agent}') 
+    return 'Check the server terminal for the client headers'
+
+
+@app.route('/profs/')
+def show_profs():
+    '''
+    Returns all the users in the collection<br/>[browser sup]
+    '''
+    return users
+
+@app.route('/set_cookies')
+def set_cookies():
+    '''
+    Returns the cookies that was sent to this server
+    '''
+    response = make_response()
+    response.set_cookie('code', 'COMP216')
+    response.set_cookie('name', 'Networking for Software Developers')
+    response.set_cookie('instructor', 'narendra pershad')
+    return response
+
+@app.route('/get_cookies')
+def get_cookies():
+    '''
+    Returns the cookies that was sent to this server
+    '''
+    print(request.cookies)
+    # return 'Check the server terminal for the client headers'
+    return(request.cookies)
+
+@app.route('/read_session')
+def read_session():
+    '''
+    Returns the number of time a visitor lands of this page<br/>[Browser sup]
+    Checks if the value is in the session variable. 
+    If the value is present one is added to it
+    If it is not present it is assigned to one 
+    '''
+    key = 'visits'
+    if key in session:
+        count = session.get(key) + 1
+        session[key] = count
+    else:
+        print('setting variable for the first time')
+        session[key] = 1
+
+    return f'You have visited this site {session.get(key)} times'
+
+@app.route('/students/<int:number_of_students>', methods=['POST', 'GET'])
+def get_students(number_of_students):
+    '''
+    Provides the means for a client to download a file from the server.
+    It will append a .bak extension the file when 
+    saving and return this new name to the client.
+    '''
+    result = {}
+    for i in range(number_of_students):
+        result[i] = {
+            'fname': choice(f_name), 
+            'lname': choice(l_name), 
+            'age': randint(20, 30), 
+            'gpa': randint(1, 17)/4,
+            'domestic': randint(1, 10) > 5,
+            'program': choice(programs),
+            'semester': randint(2, 6)}
+    return result
+
+@app.route('/download/<path:filename>', methods=['POST', 'GET'])
+def a8_file_download(filename):
+    '''
+    Provides the means for a client to download a file from the server.
+    It will append a .bak extension the file when 
+    saving and return this new name to the client.
+    '''
+    return send_file(filename_or_fp=filename)
+
+@app.route('/upload', methods=['POST'])
+def a9_file_upload():
+    '''
+    Provides the means for a client to upload a file to this server.
+    File goes into the client_upload folder.
+    '''
+    path = 'client_upload/'
+    uploaded_file = request.files['file']
+    if uploaded_file.filename != '':
+        uploaded_file.save(f'{path}{uploaded_file.filename}')
+    return f'{uploaded_file.filename} successfully uploaded'
+
+
+@app.route('/admin/add', methods = ['POST'])
+def add_prof(): 
+    '''
+    Adds a user to the data store
+    A message is returned to the client
+    This end point can only be accessed via a POST command
+    '''     
+    prof = request.get_json() 
+    users.update(prof)
+    return f' {prof} was added to the list of registered users'
+
+@app.route('/auth')
+def authRouteHandler():
+    '''
+    Implements Basic Authorization
+    Not completed, more work needed!
+    '''
+    print(request.authorization["username"])
+    print(request.authorization["password"])
+ 
+    return 'ok'
+
+@app.route('/admin-form', methods=['GET', 'POST']) 
+def form_example():
+    '''
+    The endpoint is able to process both GET and POST requests<br/>[browser sup]
+    GET returns a table of the form data submitted
+    POST returns an input form to capture data
+    '''
+    if request.method == 'POST':
+        print(request.args)                      #returns a table to the client
+        return f'''
+        <table>
+        <tr><td>First name</td><td>-- {request.form.get('fname')} --</td></tr>
+        <tr><td>Last name</td><td>-- {request.form.get('lname')} --</td></tr>
+        <tr><td>Age</td><td>-- {request.form.get('age')} --</td></tr>
+        <tr><td colspan="2"><input type="submit" value="Submit"></td></tr>
+        </table>
+        '''
+    else:                                        #HTTP GET command, returns an html form 
+        return '''
+        <form method="POST">
+        <table>
+        <tr><td>First name</td><td><input type="text" name="fname"></td></tr>
+        <tr><td>Last name</td><td><input type="text" name="lname"></td></tr>
+        <tr><td>Age</td><td><input type="text" name="age"></td></tr>
+        <tr><td colspan="2"><input type="submit" value="Submit"></td></tr>
+        </table>
+        </form>
+        '''
+
+
+@app.route('/blog/<int:postID>')      #using converter type
+def show_blog(postID):
+    '''
+    Returns some text prepended to your parameter<br/>[browser sup only if argument is supplied]
+    '''
+    return f'Blog Number: {postID}'
+
+if __name__ == '__main__':
+	app.run(debug=True)      #app.run(host, port, debug, options)
+
+    from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import plot_confusion_matrix
+from sklearn import linear_model
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import train_test_split
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+"""
+    INITIAL DATA ANALYSIS
+"""
+titanic_nestor = pd.read_csv('titanic.csv')
+print('DATAFRAME HEAD SAMPLE\n', titanic_nestor.head(3))
+print('\nDATAFRAME SHAPE\n', titanic_nestor.shape)
+print('\nDATAFRAME INFO\n')
+print(titanic_nestor.info(show_counts=True))
+
+print('>> Example unique information id : ', titanic_nestor['PassengerId'][30])
+print('>> Example passenger name : ', titanic_nestor['Name'][30])
+print('>> Example ticket number : ', titanic_nestor['Ticket'][30])
+
+print('>> Unique Passenger id Values : ', len(
+    titanic_nestor['PassengerId'].unique()))
+print('>> Unique Passenger Name Values : ',
+      len(titanic_nestor['Name'].unique()))
+print('>> Unique Ticket Values : ', len(titanic_nestor['Ticket'].unique()))
+print('>> Unique Cabin Values len : ', len(titanic_nestor['Cabin'].unique()))
+
+print('\n\nUNIQUE VALUES SEX / PCLASS')
+print(titanic_nestor['Sex'].unique())
+print(titanic_nestor['Pclass'].unique())
+
+
+"""
+    DATA VISUALIZATION 
+"""
+print('\n\nBAR CHARTS FOR SURVIVALS COMPARISON')
+pd.crosstab(titanic_nestor.Pclass, titanic_nestor.Survived,).plot(kind='bar')
+plt.title('Survived by Class (Nestor)')
+plt.xlabel('Class')
+plt.ylabel('Frequency (Survived)')
+
+pd.crosstab(titanic_nestor.Sex, titanic_nestor.Survived,).plot(kind='bar')
+plt.title('Survived by Gender (Nestor)')
+plt.xlabel('Gender')
+plt.ylabel('Frequency (Survived)')
+
+print('\n\nSCATTER MATRIX PLOT')
+pd.plotting.scatter_matrix(titanic_nestor[[
+    'Survived', 'Sex', 'Pclass', 'Fare', 'SibSp', 'Parch']],
+    alpha=0.2,
+    figsize=(10, 10))
+
+# titanic_nestor['Survived'].hist()
+#plt.title('Survived Histogram')
+
+
+"""
+    DATA TRANSFORMATION
+"""
+
+print('\n\nTRANSFORMING COLUMNS')
+titanic_nestor_set = titanic_nestor.drop(
+    ['PassengerId', 'Name', 'Ticket', 'Cabin'], axis=1)
+
+categorical_vars = ['Sex', 'Embarked']
+for var in categorical_vars:
+    categorical_var_dummy = pd.get_dummies(titanic_nestor_set[var], prefix=var)
+    titanic_nestor_set = titanic_nestor_set.join(categorical_var_dummy)
+
+titanic_nestor_set = titanic_nestor_set.drop(categorical_vars, axis=1)
+
+titanic_nestor_set['Age'].fillna(
+    value=titanic_nestor_set['Age'].mean(), inplace=True)
+titanic_nestor_set = titanic_nestor_set.astype('float64')
+print(titanic_nestor_set.info(show_counts=True))
+
+
+def normalize_dataframe(dataframe):
+    """
+    This function normalizes the values for a dataframe with all numeric 
+    columns
+
+    Parameters
+    ----------
+    dataframe 
+        All numeric dataframe
+
+    Returns
+    -------
+    Normalized dataframe
+
+    """
+    for col in dataframe.columns.values:
+        min_col = dataframe[col].min()
+        max_col = dataframe[col].max()
+        dataframe[col] = dataframe[col].apply(
+            lambda x: ((x-min_col)/(max_col-min_col)))
+
+    return dataframe
+
+
+titanic_nestor_normal = normalize_dataframe(titanic_nestor_set)
+print(titanic_nestor_normal.head(2))
+titanic_nestor_normal.hist(figsize=(9, 10))
+
+titanic_nestor_normal[['Embarked_C', 'Embarked_Q',
+                       'Embarked_S']].hist(figsize=(5, 5))
+
+y_nestor = titanic_nestor_normal['Survived']
+x_nestor = titanic_nestor_normal.drop('Survived', axis=1)
+
+# Last two digits of student id as seed
+x_train_nestor, x_test_nestor, y_train_nestor, y_test_nestor = train_test_split(
+    x_nestor, y_nestor, test_size=0.3, random_state=31)
+
+"""
+    LOGISTIC REGRESSION MODEL
+"""
+
+# Fit Logistic Regression Model
+nestor_model = linear_model.LogisticRegression(solver='lbfgs')
+nestor_model.fit(x_train_nestor, y_train_nestor)
+
+print('\n\nDISPLAY MODEL COEFFICIENTS')
+coef_df = pd.DataFrame(
+    zip(x_train_nestor.columns, np.transpose(nestor_model.coef_)))
+print(coef_df)
+
+
+print('\n\nDISPLAY CROSS-VALIDATION RESULTS')
+print('Test Size - Min Mean Max Range')
+for ts in np.arange(0.10, 0.55, 0.05):
+    x_train_cross, x_test_cross, y_train_cross, y_test_cross = train_test_split(
+        x_nestor, y_nestor, test_size=ts, random_state=31)
+
+    scores_cross = cross_val_score(linear_model.LogisticRegression(
+        solver='lbfgs'), x_train_cross, y_train_cross, scoring='accuracy', cv=10)
+
+    score_min = scores_cross.min()
+    score_max = scores_cross.max()
+    score_mean = scores_cross.mean()
+    line = "Test Size: {0:.4f}  || Metrics: {1:.4f}   {2:.4f}   {3:.4f}   {4:.4f}".format(
+        ts, score_min, score_mean, score_max, score_max - score_min)
+    print(line)
+
+
+"""
+    MODEL TESTING
+"""
+# Last two digits of student id as seed
+x_train_nestor, x_test_nestor, y_train_nestor, y_test_nestor = train_test_split(
+    x_nestor, y_nestor, test_size=0.3, random_state=31)
+# Fit Logistic Regression Model
+nestor_model = linear_model.LogisticRegression(solver='lbfgs')
+nestor_model.fit(x_train_nestor, y_train_nestor)
+
+print("\n\n*** METRICS 0.5 THRESHOLD ***")
+
+y_pred_nestor = nestor_model.predict_proba(x_test_nestor)
+y_pred_nestor_flag = y_pred_nestor[:, 1] > 0.5
+y_predicted = y_pred_nestor_flag.astype(int)
+y_predicted = np.array(y_predicted)
+
+cmatrix = confusion_matrix(y_test_nestor.values, y_predicted)
+ascore = accuracy_score(y_test_nestor.values, y_predicted)
+creport = classification_report(y_test_nestor.values, y_predicted)
+
+
+print("\n>> CONFUSION MATRIX\n", cmatrix)
+print("\n>> ACCURACY SCORE\n", ascore)
+print("\n>> CLASSIFICATION REPORT\n", creport)
+
+
+print("\n\n*** METRICS 0.75 THRESHOLD ***")
+
+# y_pred_nestor = nestor_model.predict_proba(x_test_nestor)
+y_pred_nestor_flag = y_pred_nestor[:, 1] > 0.75
+y_predicted2 = y_pred_nestor_flag.astype(int)
+y_predicted2 = np.array(y_predicted2)
+
+cmatrix2 = confusion_matrix(y_test_nestor.values, y_predicted2)
+
+ascore2 = accuracy_score(y_test_nestor.values, y_predicted2)
+creport2 = classification_report(y_test_nestor.values, y_predicted2)
+
+print("\n>> CONFUSION MATRIX\n", cmatrix2)
+print("\n>> ACCURACY SCORE\n", ascore2)
+print("\n>> CLASSIFICATION REPORT\n", creport2)
+
+tn, fp, fn, tp = confusion_matrix(y_test_nestor.values, y_predicted2).ravel()

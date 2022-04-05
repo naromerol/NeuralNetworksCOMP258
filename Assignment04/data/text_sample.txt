@@ -1,0 +1,3341 @@
+import array
+import numpy as np
+import warnings
+import scipy.sparse as sp
+import itertools
+
+from .base import baseestimator, classifiermixin, clone, is_classifier
+from .base import multioutputmixin
+from .base import metaestimatormixin, is_regressor
+from .preprocessing import labelbinarizer
+from .metrics.pairwise import euclidean_distances
+from .utils import check_random_state
+from .utils._tags import _safe_tags
+from .utils.validation import _num_samples
+from .utils.validation import check_is_fitted
+from .utils.multiclass import (
+    _check_partial_fit_first_call,
+    check_classification_targets,
+    _ovr_decision_function,
+)
+from .utils.metaestimators import _safe_split, available_if
+from .utils.fixes import delayed
+
+from joblib import parallel
+
+__all__ = [
+    "onevsrestclassifier",
+    "onevsoneclassifier",
+    "outputcodeclassifier",
+]
+
+
+def _fit_binary(estimator, x, y, classes=none):
+    """fit a single binary estimator."""
+    unique_y = np.unique(y)
+    if len(unique_y) == 1:
+        if classes is not none:
+            if y[0] == -1:
+                c = 0
+            else:
+                c = y[0]
+            warnings.warn(
+                "label %s is present in all training examples." % str(classes[c])
+            )
+        estimator = _constantpredictor().fit(x, unique_y)
+    else:
+        estimator = clone(estimator)
+        estimator.fit(x, y)
+    return estimator
+
+
+def _partial_fit_binary(estimator, x, y):
+    """partially fit a single binary estimator."""
+    estimator.partial_fit(x, y, np.array((0, 1)))
+    return estimator
+
+
+def _predict_binary(estimator, x):
+    """make predictions using a single binary estimator."""
+    if is_regressor(estimator):
+        return estimator.predict(x)
+    try:
+        score = np.ravel(estimator.decision_function(x))
+    except (attributeerror, notimplementederror):
+        # probabilities of the positive class
+        score = estimator.predict_proba(x)[:, 1]
+    return score
+
+
+def _threshold_for_binary_predict(estimator):
+    """threshold for predictions from binary estimator."""
+    if hasattr(estimator, "decision_function") and is_classifier(estimator):
+        return 0.0
+    else:
+        # predict_proba threshold
+        return 0.5
+
+
+def _check_estimator(estimator):
+    """make sure that an estimator implements the necessary methods."""
+    if not hasattr(estimator, "decision_function") and not hasattr(
+        estimator, "predict_proba"
+    ):
+        raise valueerror(
+            "the base estimator should implement decision_function or predict_proba!"
+        )
+
+
+class _constantpredictor(baseestimator):
+    def fit(self, x, y):
+        check_params = dict(
+            force_all_finite=false, dtype=none, ensure_2d=false, accept_sparse=true
+        )
+        self._validate_data(
+            x, y, reset=true, validate_separately=(check_params, check_params)
+        )
+        self.y_ = y
+        return self
+
+    def predict(self, x):
+        check_is_fitted(self)
+        self._validate_data(
+            x,
+            force_all_finite=false,
+            dtype=none,
+            accept_sparse=true,
+            ensure_2d=false,
+            reset=false,
+        )
+
+        return np.repeat(self.y_, _num_samples(x))
+
+    def decision_function(self, x):
+        check_is_fitted(self)
+        self._validate_data(
+            x,
+            force_all_finite=false,
+            dtype=none,
+            accept_sparse=true,
+            ensure_2d=false,
+            reset=false,
+        )
+
+        return np.repeat(self.y_, _num_samples(x))
+
+    def predict_proba(self, x):
+        check_is_fitted(self)
+        self._validate_data(
+            x,
+            force_all_finite=false,
+            dtype=none,
+            accept_sparse=true,
+            ensure_2d=false,
+            reset=false,
+        )
+        y_ = self.y_.astype(np.float64)
+        return np.repeat([np.hstack([1 - y_, y_])], _num_samples(x), axis=0)
+
+
+def _estimators_has(attr):
+    """check if self.estimator or self.estimators_[0] has attr.
+
+    if `self.estimators_[0]` has the attr, then its safe to assume that other
+    values has it too. this function is used together with `avaliable_if`.
+    """
+    return lambda self: (
+        hasattr(self.estimator, attr)
+        or (hasattr(self, "estimators_") and hasattr(self.estimators_[0], attr))
+    )
+
+
+class onevsrestclassifier(
+    multioutputmixin, classifiermixin, metaestimatormixin, baseestimator
+):
+    """one-vs-the-rest (ovr) multiclass strategy.
+
+    also known as one-vs-all, this strategy consists in fitting one classifier
+    per class. for each classifier, the class is fitted against all the other
+    classes. in addition to its computational efficiency (only `n_classes`
+    classifiers are needed), one advantage of this approach is its
+    interpretability. since each class is represented by one and one classifier
+    only, it is possible to gain knowledge about the class by inspecting its
+    corresponding classifier. this is the most commonly used strategy for
+    multiclass classification and is a fair default choice.
+
+    onevsrestclassifier can also be used for multilabel classification. to use
+    this feature, provide an indicator matrix for the target `y` when calling
+    `.fit`. in other words, the target labels should be formatted as a 2d
+    binary (0/1) matrix, where [i, j] == 1 indicates the presence of label j
+    in sample i. this estimator uses the binary relevance method to perform
+    multilabel classification, which involves training one binary classifier
+    independently for each label.
+
+    read more in the :ref:`user guide <ovr_classification>`.
+
+    parameters
+    ----------
+    estimator : estimator object
+        an estimator object implementing :term:`fit` and one of
+        :term:`decision_function` or :term:`predict_proba`.
+
+    n_jobs : int, default=none
+        the number of jobs to use for the computation: the `n_classes`
+        one-vs-rest problems are computed in parallel.
+
+        ``none`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. see :term:`glossary <n_jobs>`
+        for more details.
+
+        .. versionchanged:: 0.20
+           `n_jobs` default changed from 1 to none
+
+    verbose : int, default=0
+        the verbosity level, if non zero, progress messages are printed.
+        below 50, the output is sent to stderr. otherwise, the output is sent
+        to stdout. the frequency of the messages increases with the verbosity
+        level, reporting all iterations at 10. see :class:`joblib.parallel` for
+        more details.
+
+        .. versionadded:: 1.1
+
+    attributes
+    ----------
+    estimators_ : list of `n_classes` estimators
+        estimators used for predictions.
+
+    classes_ : array, shape = [`n_classes`]
+        class labels.
+
+    n_classes_ : int
+        number of classes.
+
+    label_binarizer_ : labelbinarizer object
+        object used to transform multiclass labels to binary labels and
+        vice-versa.
+
+    multilabel_ : boolean
+        whether a onevsrestclassifier is a multilabel classifier.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`. only defined if the
+        underlying estimator exposes such an attribute when fit.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. only defined if the
+        underlying estimator exposes such an attribute when fit.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    multioutputclassifier : alternate way of extending an estimator for
+        multilabel classification.
+    sklearn.preprocessing.multilabelbinarizer : transform iterable of iterables
+        to binary indicator matrix.
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.multiclass import onevsrestclassifier
+    >>> from sklearn.svm import svc
+    >>> x = np.array([
+    ...     [10, 10],
+    ...     [8, 10],
+    ...     [-5, 5.5],
+    ...     [-5.4, 5.5],
+    ...     [-20, -20],
+    ...     [-15, -20]
+    ... ])
+    >>> y = np.array([0, 0, 1, 1, 2, 2])
+    >>> clf = onevsrestclassifier(svc()).fit(x, y)
+    >>> clf.predict([[-19, -20], [9, 9], [-5, 5]])
+    array([2, 0, 1])
+    """
+
+    def __init__(self, estimator, *, n_jobs=none, verbose=0):
+        self.estimator = estimator
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+
+    def fit(self, x, y):
+        """fit underlying estimators.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        y : (sparse) array-like of shape (n_samples,) or (n_samples, n_classes)
+            multi-class targets. an indicator matrix turns on multilabel
+            classification.
+
+        returns
+        -------
+        self : object
+            instance of fitted estimator.
+        """
+        # a sparse labelbinarizer, with sparse_output=true, has been shown to
+        # outperform or match a dense label binarizer in all cases and has also
+        # resulted in less or equal memory consumption in the fit_ovr function
+        # overall.
+        self.label_binarizer_ = labelbinarizer(sparse_output=true)
+        y = self.label_binarizer_.fit_transform(y)
+        y = y.tocsc()
+        self.classes_ = self.label_binarizer_.classes_
+        columns = (col.toarray().ravel() for col in y.t)
+        # in cases where individual estimators are very fast to train setting
+        # n_jobs > 1 in can results in slower performance due to the overhead
+        # of spawning threads.  see joblib issue #112.
+        self.estimators_ = parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
+            delayed(_fit_binary)(
+                self.estimator,
+                x,
+                column,
+                classes=[
+                    "not %s" % self.label_binarizer_.classes_[i],
+                    self.label_binarizer_.classes_[i],
+                ],
+            )
+            for i, column in enumerate(columns)
+        )
+
+        if hasattr(self.estimators_[0], "n_features_in_"):
+            self.n_features_in_ = self.estimators_[0].n_features_in_
+        if hasattr(self.estimators_[0], "feature_names_in_"):
+            self.feature_names_in_ = self.estimators_[0].feature_names_in_
+
+        return self
+
+    @available_if(_estimators_has("partial_fit"))
+    def partial_fit(self, x, y, classes=none):
+        """partially fit underlying estimators.
+
+        should be used when memory is inefficient to train all data.
+        chunks of data can be passed in several iteration.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        y : (sparse) array-like of shape (n_samples,) or (n_samples, n_classes)
+            multi-class targets. an indicator matrix turns on multilabel
+            classification.
+
+        classes : array, shape (n_classes, )
+            classes across all calls to partial_fit.
+            can be obtained via `np.unique(y_all)`, where y_all is the
+            target vector of the entire dataset.
+            this argument is only required in the first call of partial_fit
+            and can be omitted in the subsequent calls.
+
+        returns
+        -------
+        self : object
+            instance of partially fitted estimator.
+        """
+        if _check_partial_fit_first_call(self, classes):
+            if not hasattr(self.estimator, "partial_fit"):
+                raise valueerror(
+                    ("base estimator {0}, doesn't have partial_fit method").format(
+                        self.estimator
+                    )
+                )
+            self.estimators_ = [clone(self.estimator) for _ in range(self.n_classes_)]
+
+            # a sparse labelbinarizer, with sparse_output=true, has been
+            # shown to outperform or match a dense label binarizer in all
+            # cases and has also resulted in less or equal memory consumption
+            # in the fit_ovr function overall.
+            self.label_binarizer_ = labelbinarizer(sparse_output=true)
+            self.label_binarizer_.fit(self.classes_)
+
+        if len(np.setdiff1d(y, self.classes_)):
+            raise valueerror(
+                (
+                    "mini-batch contains {0} while classes " + "must be subset of {1}"
+                ).format(np.unique(y), self.classes_)
+            )
+
+        y = self.label_binarizer_.transform(y)
+        y = y.tocsc()
+        columns = (col.toarray().ravel() for col in y.t)
+
+        self.estimators_ = parallel(n_jobs=self.n_jobs)(
+            delayed(_partial_fit_binary)(estimator, x, column)
+            for estimator, column in zip(self.estimators_, columns)
+        )
+
+        if hasattr(self.estimators_[0], "n_features_in_"):
+            self.n_features_in_ = self.estimators_[0].n_features_in_
+
+        return self
+
+    def predict(self, x):
+        """predict multi-class targets using underlying estimators.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        returns
+        -------
+        y : (sparse) array-like of shape (n_samples,) or (n_samples, n_classes)
+            predicted multi-class targets.
+        """
+        check_is_fitted(self)
+
+        n_samples = _num_samples(x)
+        if self.label_binarizer_.y_type_ == "multiclass":
+            maxima = np.empty(n_samples, dtype=float)
+            maxima.fill(-np.inf)
+            argmaxima = np.zeros(n_samples, dtype=int)
+            for i, e in enumerate(self.estimators_):
+                pred = _predict_binary(e, x)
+                np.maximum(maxima, pred, out=maxima)
+                argmaxima[maxima == pred] = i
+            return self.classes_[argmaxima]
+        else:
+            thresh = _threshold_for_binary_predict(self.estimators_[0])
+            indices = array.array("i")
+            indptr = array.array("i", [0])
+            for e in self.estimators_:
+                indices.extend(np.where(_predict_binary(e, x) > thresh)[0])
+                indptr.append(len(indices))
+            data = np.ones(len(indices), dtype=int)
+            indicator = sp.csc_matrix(
+                (data, indices, indptr), shape=(n_samples, len(self.estimators_))
+            )
+            return self.label_binarizer_.inverse_transform(indicator)
+
+    @available_if(_estimators_has("predict_proba"))
+    def predict_proba(self, x):
+        """probability estimates.
+
+        the returned estimates for all classes are ordered by label of classes.
+
+        note that in the multilabel case, each sample can have any number of
+        labels. this returns the marginal probability that the given sample has
+        the label in question. for example, it is entirely consistent that two
+        labels both have a 90% probability of applying to a given sample.
+
+        in the single label multiclass case, the rows of the returned matrix
+        sum to 1.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            input data.
+
+        returns
+        -------
+        t : (sparse) array-like of shape (n_samples, n_classes)
+            returns the probability of the sample for each class in the model,
+            where classes are ordered as they are in `self.classes_`.
+        """
+        check_is_fitted(self)
+        # y[i, j] gives the probability that sample i has the label j.
+        # in the multi-label case, these are not disjoint.
+        y = np.array([e.predict_proba(x)[:, 1] for e in self.estimators_]).t
+
+        if len(self.estimators_) == 1:
+            # only one estimator, but we still want to return probabilities
+            # for two classes.
+            y = np.concatenate(((1 - y), y), axis=1)
+
+        if not self.multilabel_:
+            # then, probabilities should be normalized to 1.
+            y /= np.sum(y, axis=1)[:, np.newaxis]
+        return y
+
+    @available_if(_estimators_has("decision_function"))
+    def decision_function(self, x):
+        """decision function for the onevsrestclassifier.
+
+        return the distance of each sample from the decision boundary for each
+        class. this can only be used with estimators which implement the
+        `decision_function` method.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            input data.
+
+        returns
+        -------
+        t : array-like of shape (n_samples, n_classes) or (n_samples,) for \
+            binary classification.
+            result of calling `decision_function` on the final estimator.
+
+            .. versionchanged:: 0.19
+                output shape changed to ``(n_samples,)`` to conform to
+                scikit-learn conventions for binary classification.
+        """
+        check_is_fitted(self)
+        if len(self.estimators_) == 1:
+            return self.estimators_[0].decision_function(x)
+        return np.array(
+            [est.decision_function(x).ravel() for est in self.estimators_]
+        ).t
+
+    @property
+    def multilabel_(self):
+        """whether this is a multilabel classifier."""
+        return self.label_binarizer_.y_type_.startswith("multilabel")
+
+    @property
+    def n_classes_(self):
+        """number of classes."""
+        return len(self.classes_)
+
+    def _more_tags(self):
+        """indicate if wrapped estimator is using a precomputed gram matrix"""
+        return {"pairwise": _safe_tags(self.estimator, key="pairwise")}
+
+
+def _fit_ovo_binary(estimator, x, y, i, j):
+    """fit a single binary estimator (one-vs-one)."""
+    cond = np.logical_or(y == i, y == j)
+    y = y[cond]
+    y_binary = np.empty(y.shape, int)
+    y_binary[y == i] = 0
+    y_binary[y == j] = 1
+    indcond = np.arange(_num_samples(x))[cond]
+    return (
+        _fit_binary(
+            estimator,
+            _safe_split(estimator, x, none, indices=indcond)[0],
+            y_binary,
+            classes=[i, j],
+        ),
+        indcond,
+    )
+
+
+def _partial_fit_ovo_binary(estimator, x, y, i, j):
+    """partially fit a single binary estimator(one-vs-one)."""
+
+    cond = np.logical_or(y == i, y == j)
+    y = y[cond]
+    if len(y) != 0:
+        y_binary = np.zeros_like(y)
+        y_binary[y == j] = 1
+        return _partial_fit_binary(estimator, x[cond], y_binary)
+    return estimator
+
+
+class onevsoneclassifier(metaestimatormixin, classifiermixin, baseestimator):
+    """one-vs-one multiclass strategy.
+
+    this strategy consists in fitting one classifier per class pair.
+    at prediction time, the class which received the most votes is selected.
+    since it requires to fit `n_classes * (n_classes - 1) / 2` classifiers,
+    this method is usually slower than one-vs-the-rest, due to its
+    o(n_classes^2) complexity. however, this method may be advantageous for
+    algorithms such as kernel algorithms which don't scale well with
+    `n_samples`. this is because each individual learning problem only involves
+    a small subset of the data whereas, with one-vs-the-rest, the complete
+    dataset is used `n_classes` times.
+
+    read more in the :ref:`user guide <ovo_classification>`.
+
+    parameters
+    ----------
+    estimator : estimator object
+        an estimator object implementing :term:`fit` and one of
+        :term:`decision_function` or :term:`predict_proba`.
+
+    n_jobs : int, default=none
+        the number of jobs to use for the computation: the `n_classes * (
+        n_classes - 1) / 2` ovo problems are computed in parallel.
+
+        ``none`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. see :term:`glossary <n_jobs>`
+        for more details.
+
+    attributes
+    ----------
+    estimators_ : list of ``n_classes * (n_classes - 1) / 2`` estimators
+        estimators used for predictions.
+
+    classes_ : numpy array of shape [n_classes]
+        array containing labels.
+
+    n_classes_ : int
+        number of classes.
+
+    pairwise_indices_ : list, length = ``len(estimators_)``, or ``none``
+        indices of samples used when training the estimators.
+        ``none`` when ``estimator``'s `pairwise` tag is false.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    onevsrestclassifier : one-vs-all multiclass strategy.
+
+    examples
+    --------
+    >>> from sklearn.datasets import load_iris
+    >>> from sklearn.model_selection import train_test_split
+    >>> from sklearn.multiclass import onevsoneclassifier
+    >>> from sklearn.svm import linearsvc
+    >>> x, y = load_iris(return_x_y=true)
+    >>> x_train, x_test, y_train, y_test = train_test_split(
+    ...     x, y, test_size=0.33, shuffle=true, random_state=0)
+    >>> clf = onevsoneclassifier(
+    ...     linearsvc(random_state=0)).fit(x_train, y_train)
+    >>> clf.predict(x_test[:10])
+    array([2, 1, 0, 2, 0, 2, 0, 1, 1, 1])
+    """
+
+    def __init__(self, estimator, *, n_jobs=none):
+        self.estimator = estimator
+        self.n_jobs = n_jobs
+
+    def fit(self, x, y):
+        """fit underlying estimators.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        y : array-like of shape (n_samples,)
+            multi-class targets.
+
+        returns
+        -------
+        self : object
+            the fitted underlying estimator.
+        """
+        # we need to validate the data because we do a safe_indexing later.
+        x, y = self._validate_data(
+            x, y, accept_sparse=["csr", "csc"], force_all_finite=false
+        )
+        check_classification_targets(y)
+
+        self.classes_ = np.unique(y)
+        if len(self.classes_) == 1:
+            raise valueerror(
+                "onevsoneclassifier can not be fit when only one class is present."
+            )
+        n_classes = self.classes_.shape[0]
+        estimators_indices = list(
+            zip(
+                *(
+                    parallel(n_jobs=self.n_jobs)(
+                        delayed(_fit_ovo_binary)(
+                            self.estimator, x, y, self.classes_[i], self.classes_[j]
+                        )
+                        for i in range(n_classes)
+                        for j in range(i + 1, n_classes)
+                    )
+                )
+            )
+        )
+
+        self.estimators_ = estimators_indices[0]
+
+        pairwise = self._get_tags()["pairwise"]
+        self.pairwise_indices_ = estimators_indices[1] if pairwise else none
+
+        return self
+
+    @available_if(_estimators_has("partial_fit"))
+    def partial_fit(self, x, y, classes=none):
+        """partially fit underlying estimators.
+
+        should be used when memory is inefficient to train all data. chunks
+        of data can be passed in several iteration, where the first call
+        should have an array of all target variables.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        y : array-like of shape (n_samples,)
+            multi-class targets.
+
+        classes : array, shape (n_classes, )
+            classes across all calls to partial_fit.
+            can be obtained via `np.unique(y_all)`, where y_all is the
+            target vector of the entire dataset.
+            this argument is only required in the first call of partial_fit
+            and can be omitted in the subsequent calls.
+
+        returns
+        -------
+        self : object
+            the partially fitted underlying estimator.
+        """
+        first_call = _check_partial_fit_first_call(self, classes)
+        if first_call:
+            self.estimators_ = [
+                clone(self.estimator)
+                for _ in range(self.n_classes_ * (self.n_classes_ - 1) // 2)
+            ]
+
+        if len(np.setdiff1d(y, self.classes_)):
+            raise valueerror(
+                "mini-batch contains {0} while it must be subset of {1}".format(
+                    np.unique(y), self.classes_
+                )
+            )
+
+        x, y = self._validate_data(
+            x,
+            y,
+            accept_sparse=["csr", "csc"],
+            force_all_finite=false,
+            reset=first_call,
+        )
+        check_classification_targets(y)
+        combinations = itertools.combinations(range(self.n_classes_), 2)
+        self.estimators_ = parallel(n_jobs=self.n_jobs)(
+            delayed(_partial_fit_ovo_binary)(
+                estimator, x, y, self.classes_[i], self.classes_[j]
+            )
+            for estimator, (i, j) in zip(self.estimators_, (combinations))
+        )
+
+        self.pairwise_indices_ = none
+
+        if hasattr(self.estimators_[0], "n_features_in_"):
+            self.n_features_in_ = self.estimators_[0].n_features_in_
+
+        return self
+
+    def predict(self, x):
+        """estimate the best class label for each sample in x.
+
+        this is implemented as ``argmax(decision_function(x), axis=1)`` which
+        will return the label of the class with most votes by estimators
+        predicting the outcome of a decision for each possible class pair.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        returns
+        -------
+        y : numpy array of shape [n_samples]
+            predicted multi-class targets.
+        """
+        y = self.decision_function(x)
+        if self.n_classes_ == 2:
+            thresh = _threshold_for_binary_predict(self.estimators_[0])
+            return self.classes_[(y > thresh).astype(int)]
+        return self.classes_[y.argmax(axis=1)]
+
+    def decision_function(self, x):
+        """decision function for the onevsoneclassifier.
+
+        the decision values for the samples are computed by adding the
+        normalized sum of pair-wise classification confidence levels to the
+        votes in order to disambiguate between the decision values when the
+        votes for all the classes are equal leading to a tie.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            input data.
+
+        returns
+        -------
+        y : array-like of shape (n_samples, n_classes) or (n_samples,)
+            result of calling `decision_function` on the final estimator.
+
+            .. versionchanged:: 0.19
+                output shape changed to ``(n_samples,)`` to conform to
+                scikit-learn conventions for binary classification.
+        """
+        check_is_fitted(self)
+        x = self._validate_data(
+            x,
+            accept_sparse=true,
+            force_all_finite=false,
+            reset=false,
+        )
+
+        indices = self.pairwise_indices_
+        if indices is none:
+            xs = [x] * len(self.estimators_)
+        else:
+            xs = [x[:, idx] for idx in indices]
+
+        predictions = np.vstack(
+            [est.predict(xi) for est, xi in zip(self.estimators_, xs)]
+        ).t
+        confidences = np.vstack(
+            [_predict_binary(est, xi) for est, xi in zip(self.estimators_, xs)]
+        ).t
+        y = _ovr_decision_function(predictions, confidences, len(self.classes_))
+        if self.n_classes_ == 2:
+            return y[:, 1]
+        return y
+
+    @property
+    def n_classes_(self):
+        """number of classes."""
+        return len(self.classes_)
+
+    def _more_tags(self):
+        """indicate if wrapped estimator is using a precomputed gram matrix"""
+        return {"pairwise": _safe_tags(self.estimator, key="pairwise")}
+
+
+class outputcodeclassifier(metaestimatormixin, classifiermixin, baseestimator):
+    """(error-correcting) output-code multiclass strategy.
+
+    output-code based strategies consist in representing each class with a
+    binary code (an array of 0s and 1s). at fitting time, one binary
+    classifier per bit in the code book is fitted.  at prediction time, the
+    classifiers are used to project new points in the class space and the class
+    closest to the points is chosen. the main advantage of these strategies is
+    that the number of classifiers used can be controlled by the user, either
+    for compressing the model (0 < code_size < 1) or for making the model more
+    robust to errors (code_size > 1). see the documentation for more details.
+
+    read more in the :ref:`user guide <ecoc>`.
+
+    parameters
+    ----------
+    estimator : estimator object
+        an estimator object implementing :term:`fit` and one of
+        :term:`decision_function` or :term:`predict_proba`.
+
+    code_size : float, default=1.5
+        percentage of the number of classes to be used to create the code book.
+        a number between 0 and 1 will require fewer classifiers than
+        one-vs-the-rest. a number greater than 1 will require more classifiers
+        than one-vs-the-rest.
+
+    random_state : int, randomstate instance, default=none
+        the generator used to initialize the codebook.
+        pass an int for reproducible output across multiple function calls.
+        see :term:`glossary <random_state>`.
+
+    n_jobs : int, default=none
+        the number of jobs to use for the computation: the multiclass problems
+        are computed in parallel.
+
+        ``none`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. see :term:`glossary <n_jobs>`
+        for more details.
+
+    attributes
+    ----------
+    estimators_ : list of `int(n_classes * code_size)` estimators
+        estimators used for predictions.
+
+    classes_ : ndarray of shape (n_classes,)
+        array containing labels.
+
+    code_book_ : ndarray of shape (n_classes, code_size)
+        binary array containing the code of each class.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`. only defined if the
+        underlying estimator exposes such an attribute when fit.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. only defined if the
+        underlying estimator exposes such an attribute when fit.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    onevsrestclassifier : one-vs-all multiclass strategy.
+    onevsoneclassifier : one-vs-one multiclass strategy.
+
+    references
+    ----------
+
+    .. [1] "solving multiclass learning problems via error-correcting output
+       codes",
+       dietterich t., bakiri g.,
+       journal of artificial intelligence research 2,
+       1995.
+
+    .. [2] "the error coding method and picts",
+       james g., hastie t.,
+       journal of computational and graphical statistics 7,
+       1998.
+
+    .. [3] "the elements of statistical learning",
+       hastie t., tibshirani r., friedman j., page 606 (second-edition)
+       2008.
+
+    examples
+    --------
+    >>> from sklearn.multiclass import outputcodeclassifier
+    >>> from sklearn.ensemble import randomforestclassifier
+    >>> from sklearn.datasets import make_classification
+    >>> x, y = make_classification(n_samples=100, n_features=4,
+    ...                            n_informative=2, n_redundant=0,
+    ...                            random_state=0, shuffle=false)
+    >>> clf = outputcodeclassifier(
+    ...     estimator=randomforestclassifier(random_state=0),
+    ...     random_state=0).fit(x, y)
+    >>> clf.predict([[0, 0, 0, 0]])
+    array([1])
+    """
+
+    def __init__(self, estimator, *, code_size=1.5, random_state=none, n_jobs=none):
+        self.estimator = estimator
+        self.code_size = code_size
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+
+    def fit(self, x, y):
+        """fit underlying estimators.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        y : array-like of shape (n_samples,)
+            multi-class targets.
+
+        returns
+        -------
+        self : object
+            returns a fitted instance of self.
+        """
+        y = self._validate_data(x="no_validation", y=y)
+
+        if self.code_size <= 0:
+            raise valueerror(
+                "code_size should be greater than 0, got {0}".format(self.code_size)
+            )
+
+        _check_estimator(self.estimator)
+        random_state = check_random_state(self.random_state)
+        check_classification_targets(y)
+
+        self.classes_ = np.unique(y)
+        n_classes = self.classes_.shape[0]
+        if n_classes == 0:
+            raise valueerror(
+                "outputcodeclassifier can not be fit when no class is present."
+            )
+        code_size_ = int(n_classes * self.code_size)
+
+        # fixme: there are more elaborate methods than generating the codebook
+        # randomly.
+        self.code_book_ = random_state.uniform(size=(n_classes, code_size_))
+        self.code_book_[self.code_book_ > 0.5] = 1
+
+        if hasattr(self.estimator, "decision_function"):
+            self.code_book_[self.code_book_ != 1] = -1
+        else:
+            self.code_book_[self.code_book_ != 1] = 0
+
+        classes_index = {c: i for i, c in enumerate(self.classes_)}
+
+        y = np.array(
+            [self.code_book_[classes_index[y[i]]] for i in range(_num_samples(y))],
+            dtype=int,
+        )
+
+        self.estimators_ = parallel(n_jobs=self.n_jobs)(
+            delayed(_fit_binary)(self.estimator, x, y[:, i]) for i in range(y.shape[1])
+        )
+
+        if hasattr(self.estimators_[0], "n_features_in_"):
+            self.n_features_in_ = self.estimators_[0].n_features_in_
+        if hasattr(self.estimators_[0], "feature_names_in_"):
+            self.feature_names_in_ = self.estimators_[0].feature_names_in_
+
+        return self
+
+    def predict(self, x):
+        """predict multi-class targets using underlying estimators.
+
+        parameters
+        ----------
+        x : (sparse) array-like of shape (n_samples, n_features)
+            data.
+
+        returns
+        -------
+        y : ndarray of shape (n_samples,)
+            predicted multi-class targets.
+        """
+        check_is_fitted(self)
+        y = np.array([_predict_binary(e, x) for e in self.estimators_]).t
+        pred = euclidean_distances(y, self.code_book_).argmin(axis=1)
+        return self.classes_[pred]import numpy as np
+import scipy.sparse as sp
+from joblib import parallel
+
+from abc import abcmeta, abstractmethod
+from .base import baseestimator, clone, metaestimatormixin
+from .base import regressormixin, classifiermixin, is_classifier
+from .model_selection import cross_val_predict
+from .utils.metaestimators import available_if
+from .utils import check_random_state
+from .utils.validation import check_is_fitted, has_fit_parameter, _check_fit_params
+from .utils.multiclass import check_classification_targets
+from .utils.fixes import delayed
+
+__all__ = [
+    "multioutputregressor",
+    "multioutputclassifier",
+    "classifierchain",
+    "regressorchain",
+]
+
+
+def _fit_estimator(estimator, x, y, sample_weight=none, **fit_params):
+    estimator = clone(estimator)
+    if sample_weight is not none:
+        estimator.fit(x, y, sample_weight=sample_weight, **fit_params)
+    else:
+        estimator.fit(x, y, **fit_params)
+    return estimator
+
+
+def _partial_fit_estimator(
+    estimator, x, y, classes=none, sample_weight=none, first_time=true
+):
+    if first_time:
+        estimator = clone(estimator)
+
+    if sample_weight is not none:
+        if classes is not none:
+            estimator.partial_fit(x, y, classes=classes, sample_weight=sample_weight)
+        else:
+            estimator.partial_fit(x, y, sample_weight=sample_weight)
+    else:
+        if classes is not none:
+            estimator.partial_fit(x, y, classes=classes)
+        else:
+            estimator.partial_fit(x, y)
+    return estimator
+
+
+def _available_if_estimator_has(attr):
+    """return a function to check if `estimator` or `estimators_` has `attr`.
+
+    helper for chain implementations.
+    """
+
+    def _check(self):
+        return hasattr(self.estimator, attr) or all(
+            hasattr(est, attr) for est in self.estimators_
+        )
+
+    return available_if(_check)
+
+
+class _multioutputestimator(metaestimatormixin, baseestimator, metaclass=abcmeta):
+    @abstractmethod
+    def __init__(self, estimator, *, n_jobs=none):
+        self.estimator = estimator
+        self.n_jobs = n_jobs
+
+    @_available_if_estimator_has("partial_fit")
+    def partial_fit(self, x, y, classes=none, sample_weight=none):
+        """incrementally fit a separate model for each class output.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : {array-like, sparse matrix} of shape (n_samples, n_outputs)
+            multi-output targets.
+
+        classes : list of ndarray of shape (n_outputs,), default=none
+            each array is unique classes for one output in str/int.
+            can be obtained via
+            ``[np.unique(y[:, i]) for i in range(y.shape[1])]``, where `y`
+            is the target matrix of the entire dataset.
+            this argument is required for the first call to partial_fit
+            and can be omitted in the subsequent calls.
+            note that `y` doesn't need to contain all labels in `classes`.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            sample weights. if `none`, then samples are equally weighted.
+            only supported if the underlying regressor supports sample
+            weights.
+
+        returns
+        -------
+        self : object
+            returns a fitted instance.
+        """
+        first_time = not hasattr(self, "estimators_")
+        y = self._validate_data(x="no_validation", y=y, multi_output=true)
+
+        if y.ndim == 1:
+            raise valueerror(
+                "y must have at least two dimensions for "
+                "multi-output regression but has only one."
+            )
+
+        if sample_weight is not none and not has_fit_parameter(
+            self.estimator, "sample_weight"
+        ):
+            raise valueerror("underlying estimator does not support sample weights.")
+
+        first_time = not hasattr(self, "estimators_")
+
+        self.estimators_ = parallel(n_jobs=self.n_jobs)(
+            delayed(_partial_fit_estimator)(
+                self.estimators_[i] if not first_time else self.estimator,
+                x,
+                y[:, i],
+                classes[i] if classes is not none else none,
+                sample_weight,
+                first_time,
+            )
+            for i in range(y.shape[1])
+        )
+
+        if first_time and hasattr(self.estimators_[0], "n_features_in_"):
+            self.n_features_in_ = self.estimators_[0].n_features_in_
+        if first_time and hasattr(self.estimators_[0], "feature_names_in_"):
+            self.feature_names_in_ = self.estimators_[0].feature_names_in_
+
+        return self
+
+    def fit(self, x, y, sample_weight=none, **fit_params):
+        """fit the model to data, separately for each output variable.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : {array-like, sparse matrix} of shape (n_samples, n_outputs)
+            multi-output targets. an indicator matrix turns on multilabel
+            estimation.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            sample weights. if `none`, then samples are equally weighted.
+            only supported if the underlying regressor supports sample
+            weights.
+
+        **fit_params : dict of string -> object
+            parameters passed to the ``estimator.fit`` method of each step.
+
+            .. versionadded:: 0.23
+
+        returns
+        -------
+        self : object
+            returns a fitted instance.
+        """
+
+        if not hasattr(self.estimator, "fit"):
+            raise valueerror("the base estimator should implement a fit method")
+
+        y = self._validate_data(x="no_validation", y=y, multi_output=true)
+
+        if is_classifier(self):
+            check_classification_targets(y)
+
+        if y.ndim == 1:
+            raise valueerror(
+                "y must have at least two dimensions for "
+                "multi-output regression but has only one."
+            )
+
+        if sample_weight is not none and not has_fit_parameter(
+            self.estimator, "sample_weight"
+        ):
+            raise valueerror("underlying estimator does not support sample weights.")
+
+        fit_params_validated = _check_fit_params(x, fit_params)
+
+        self.estimators_ = parallel(n_jobs=self.n_jobs)(
+            delayed(_fit_estimator)(
+                self.estimator, x, y[:, i], sample_weight, **fit_params_validated
+            )
+            for i in range(y.shape[1])
+        )
+
+        if hasattr(self.estimators_[0], "n_features_in_"):
+            self.n_features_in_ = self.estimators_[0].n_features_in_
+        if hasattr(self.estimators_[0], "feature_names_in_"):
+            self.feature_names_in_ = self.estimators_[0].feature_names_in_
+
+        return self
+
+    def predict(self, x):
+        """predict multi-output variable using model for each target variable.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        returns
+        -------
+        y : {array-like, sparse matrix} of shape (n_samples, n_outputs)
+            multi-output targets predicted across multiple predictors.
+            note: separate models are generated for each predictor.
+        """
+        check_is_fitted(self)
+        if not hasattr(self.estimators_[0], "predict"):
+            raise valueerror("the base estimator should implement a predict method")
+
+        y = parallel(n_jobs=self.n_jobs)(
+            delayed(e.predict)(x) for e in self.estimators_
+        )
+
+        return np.asarray(y).t
+
+    def _more_tags(self):
+        return {"multioutput_only": true}
+
+
+class multioutputregressor(regressormixin, _multioutputestimator):
+    """multi target regression.
+
+    this strategy consists of fitting one regressor per target. this is a
+    simple strategy for extending regressors that do not natively support
+    multi-target regression.
+
+    .. versionadded:: 0.18
+
+    parameters
+    ----------
+    estimator : estimator object
+        an estimator object implementing :term:`fit` and :term:`predict`.
+
+    n_jobs : int or none, optional (default=none)
+        the number of jobs to run in parallel.
+        :meth:`fit`, :meth:`predict` and :meth:`partial_fit` (if supported
+        by the passed estimator) will be parallelized for each target.
+
+        when individual estimators are fast to train or predict,
+        using ``n_jobs > 1`` can result in slower performance due
+        to the parallelism overhead.
+
+        ``none`` means `1` unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all available processes / threads.
+        see :term:`glossary <n_jobs>` for more details.
+
+        .. versionchanged:: 0.20
+            `n_jobs` default changed from `1` to `none`.
+
+    attributes
+    ----------
+    estimators_ : list of ``n_output`` estimators
+        estimators used for predictions.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`. only defined if the
+        underlying `estimator` exposes such an attribute when fit.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. only defined if the
+        underlying estimators expose such an attribute when fit.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    regressorchain : a multi-label model that arranges regressions into a
+        chain.
+    multioutputclassifier : classifies each output independently rather than
+        chaining.
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.datasets import load_linnerud
+    >>> from sklearn.multioutput import multioutputregressor
+    >>> from sklearn.linear_model import ridge
+    >>> x, y = load_linnerud(return_x_y=true)
+    >>> regr = multioutputregressor(ridge(random_state=123)).fit(x, y)
+    >>> regr.predict(x[[0]])
+    array([[176..., 35..., 57...]])
+    """
+
+    def __init__(self, estimator, *, n_jobs=none):
+        super().__init__(estimator, n_jobs=n_jobs)
+
+    @_available_if_estimator_has("partial_fit")
+    def partial_fit(self, x, y, sample_weight=none):
+        """incrementally fit the model to data, for each output variable.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : {array-like, sparse matrix} of shape (n_samples, n_outputs)
+            multi-output targets.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            sample weights. if `none`, then samples are equally weighted.
+            only supported if the underlying regressor supports sample
+            weights.
+
+        returns
+        -------
+        self : object
+            returns a fitted instance.
+        """
+        super().partial_fit(x, y, sample_weight=sample_weight)
+
+
+class multioutputclassifier(classifiermixin, _multioutputestimator):
+    """multi target classification.
+
+    this strategy consists of fitting one classifier per target. this is a
+    simple strategy for extending classifiers that do not natively support
+    multi-target classification.
+
+    parameters
+    ----------
+    estimator : estimator object
+        an estimator object implementing :term:`fit`, :term:`score` and
+        :term:`predict_proba`.
+
+    n_jobs : int or none, optional (default=none)
+        the number of jobs to run in parallel.
+        :meth:`fit`, :meth:`predict` and :meth:`partial_fit` (if supported
+        by the passed estimator) will be parallelized for each target.
+
+        when individual estimators are fast to train or predict,
+        using ``n_jobs > 1`` can result in slower performance due
+        to the parallelism overhead.
+
+        ``none`` means `1` unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all available processes / threads.
+        see :term:`glossary <n_jobs>` for more details.
+
+        .. versionchanged:: 0.20
+            `n_jobs` default changed from `1` to `none`.
+
+    attributes
+    ----------
+    classes_ : ndarray of shape (n_classes,)
+        class labels.
+
+    estimators_ : list of ``n_output`` estimators
+        estimators used for predictions.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`. only defined if the
+        underlying `estimator` exposes such an attribute when fit.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. only defined if the
+        underlying estimators expose such an attribute when fit.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    classifierchain : a multi-label model that arranges binary classifiers
+        into a chain.
+    multioutputregressor : fits one regressor per target variable.
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.datasets import make_multilabel_classification
+    >>> from sklearn.multioutput import multioutputclassifier
+    >>> from sklearn.linear_model import logisticregression
+    >>> x, y = make_multilabel_classification(n_classes=3, random_state=0)
+    >>> clf = multioutputclassifier(logisticregression()).fit(x, y)
+    >>> clf.predict(x[-2:])
+    array([[1, 1, 1],
+           [1, 0, 1]])
+    """
+
+    def __init__(self, estimator, *, n_jobs=none):
+        super().__init__(estimator, n_jobs=n_jobs)
+
+    def fit(self, x, y, sample_weight=none, **fit_params):
+        """fit the model to data matrix x and targets y.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : array-like of shape (n_samples, n_classes)
+            the target values.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            sample weights. if `none`, then samples are equally weighted.
+            only supported if the underlying classifier supports sample
+            weights.
+
+        **fit_params : dict of string -> object
+            parameters passed to the ``estimator.fit`` method of each step.
+
+            .. versionadded:: 0.23
+
+        returns
+        -------
+        self : object
+            returns a fitted instance.
+        """
+        super().fit(x, y, sample_weight, **fit_params)
+        self.classes_ = [estimator.classes_ for estimator in self.estimators_]
+        return self
+
+    def _check_predict_proba(self):
+        if hasattr(self, "estimators_"):
+            # raise an attributeerror if `predict_proba` does not exist for
+            # each estimator
+            [getattr(est, "predict_proba") for est in self.estimators_]
+            return true
+        # raise an attributeerror if `predict_proba` does not exist for the
+        # unfitted estimator
+        getattr(self.estimator, "predict_proba")
+        return true
+
+    @available_if(_check_predict_proba)
+    def predict_proba(self, x):
+        """return prediction probabilities for each class of each output.
+
+        this method will raise a ``valueerror`` if any of the
+        estimators do not have ``predict_proba``.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            the input data.
+
+        returns
+        -------
+        p : array of shape (n_samples, n_classes), or a list of n_outputs \
+                such arrays if n_outputs > 1.
+            the class probabilities of the input samples. the order of the
+            classes corresponds to that in the attribute :term:`classes_`.
+
+            .. versionchanged:: 0.19
+                this function now returns a list of arrays where the length of
+                the list is ``n_outputs``, and each array is (``n_samples``,
+                ``n_classes``) for that particular output.
+        """
+        check_is_fitted(self)
+        results = [estimator.predict_proba(x) for estimator in self.estimators_]
+        return results
+
+    def score(self, x, y):
+        """return the mean accuracy on the given test data and labels.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            test samples.
+
+        y : array-like of shape (n_samples, n_outputs)
+            true values for x.
+
+        returns
+        -------
+        scores : float
+            mean accuracy of predicted target versus true target.
+        """
+        check_is_fitted(self)
+        n_outputs_ = len(self.estimators_)
+        if y.ndim == 1:
+            raise valueerror(
+                "y must have at least two dimensions for "
+                "multi target classification but has only one"
+            )
+        if y.shape[1] != n_outputs_:
+            raise valueerror(
+                "the number of outputs of y for fit {0} and"
+                " score {1} should be same".format(n_outputs_, y.shape[1])
+            )
+        y_pred = self.predict(x)
+        return np.mean(np.all(y == y_pred, axis=1))
+
+    def _more_tags(self):
+        # fixme
+        return {"_skip_test": true}
+
+
+def _available_if_base_estimator_has(attr):
+    """return a function to check if `base_estimator` or `estimators_` has `attr`.
+
+    helper for chain implementations.
+    """
+
+    def _check(self):
+        return hasattr(self.base_estimator, attr) or all(
+            hasattr(est, attr) for est in self.estimators_
+        )
+
+    return available_if(_check)
+
+
+class _basechain(baseestimator, metaclass=abcmeta):
+    def __init__(self, base_estimator, *, order=none, cv=none, random_state=none):
+        self.base_estimator = base_estimator
+        self.order = order
+        self.cv = cv
+        self.random_state = random_state
+
+    @abstractmethod
+    def fit(self, x, y, **fit_params):
+        """fit the model to data matrix x and targets y.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : array-like of shape (n_samples, n_classes)
+            the target values.
+
+        **fit_params : dict of string -> object
+            parameters passed to the `fit` method of each step.
+
+            .. versionadded:: 0.23
+
+        returns
+        -------
+        self : object
+            returns a fitted instance.
+        """
+        x, y = self._validate_data(x, y, multi_output=true, accept_sparse=true)
+
+        random_state = check_random_state(self.random_state)
+        self.order_ = self.order
+        if isinstance(self.order_, tuple):
+            self.order_ = np.array(self.order_)
+
+        if self.order_ is none:
+            self.order_ = np.array(range(y.shape[1]))
+        elif isinstance(self.order_, str):
+            if self.order_ == "random":
+                self.order_ = random_state.permutation(y.shape[1])
+        elif sorted(self.order_) != list(range(y.shape[1])):
+            raise valueerror("invalid order")
+
+        self.estimators_ = [clone(self.base_estimator) for _ in range(y.shape[1])]
+
+        if self.cv is none:
+            y_pred_chain = y[:, self.order_]
+            if sp.issparse(x):
+                x_aug = sp.hstack((x, y_pred_chain), format="lil")
+                x_aug = x_aug.tocsr()
+            else:
+                x_aug = np.hstack((x, y_pred_chain))
+
+        elif sp.issparse(x):
+            y_pred_chain = sp.lil_matrix((x.shape[0], y.shape[1]))
+            x_aug = sp.hstack((x, y_pred_chain), format="lil")
+
+        else:
+            y_pred_chain = np.zeros((x.shape[0], y.shape[1]))
+            x_aug = np.hstack((x, y_pred_chain))
+
+        del y_pred_chain
+
+        for chain_idx, estimator in enumerate(self.estimators_):
+            y = y[:, self.order_[chain_idx]]
+            estimator.fit(x_aug[:, : (x.shape[1] + chain_idx)], y, **fit_params)
+            if self.cv is not none and chain_idx < len(self.estimators_) - 1:
+                col_idx = x.shape[1] + chain_idx
+                cv_result = cross_val_predict(
+                    self.base_estimator, x_aug[:, :col_idx], y=y, cv=self.cv
+                )
+                if sp.issparse(x_aug):
+                    x_aug[:, col_idx] = np.expand_dims(cv_result, 1)
+                else:
+                    x_aug[:, col_idx] = cv_result
+
+        return self
+
+    def predict(self, x):
+        """predict on the data matrix x using the classifierchain model.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        returns
+        -------
+        y_pred : array-like of shape (n_samples, n_classes)
+            the predicted values.
+        """
+        check_is_fitted(self)
+        x = self._validate_data(x, accept_sparse=true, reset=false)
+        y_pred_chain = np.zeros((x.shape[0], len(self.estimators_)))
+        for chain_idx, estimator in enumerate(self.estimators_):
+            previous_predictions = y_pred_chain[:, :chain_idx]
+            if sp.issparse(x):
+                if chain_idx == 0:
+                    x_aug = x
+                else:
+                    x_aug = sp.hstack((x, previous_predictions))
+            else:
+                x_aug = np.hstack((x, previous_predictions))
+            y_pred_chain[:, chain_idx] = estimator.predict(x_aug)
+
+        inv_order = np.empty_like(self.order_)
+        inv_order[self.order_] = np.arange(len(self.order_))
+        y_pred = y_pred_chain[:, inv_order]
+
+        return y_pred
+
+
+class classifierchain(metaestimatormixin, classifiermixin, _basechain):
+    """a multi-label model that arranges binary classifiers into a chain.
+
+    each model makes a prediction in the order specified by the chain using
+    all of the available features provided to the model plus the predictions
+    of models that are earlier in the chain.
+
+    read more in the :ref:`user guide <classifierchain>`.
+
+    .. versionadded:: 0.19
+
+    parameters
+    ----------
+    base_estimator : estimator
+        the base estimator from which the classifier chain is built.
+
+    order : array-like of shape (n_outputs,) or 'random', default=none
+        if `none`, the order will be determined by the order of columns in
+        the label matrix y.::
+
+            order = [0, 1, 2, ..., y.shape[1] - 1]
+
+        the order of the chain can be explicitly set by providing a list of
+        integers. for example, for a chain of length 5.::
+
+            order = [1, 3, 2, 4, 0]
+
+        means that the first model in the chain will make predictions for
+        column 1 in the y matrix, the second model will make predictions
+        for column 3, etc.
+
+        if order is `random` a random ordering will be used.
+
+    cv : int, cross-validation generator or an iterable, default=none
+        determines whether to use cross validated predictions or true
+        labels for the results of previous estimators in the chain.
+        possible inputs for cv are:
+
+        - none, to use true labels when fitting,
+        - integer, to specify the number of folds in a (stratified)kfold,
+        - :term:`cv splitter`,
+        - an iterable yielding (train, test) splits as arrays of indices.
+
+    random_state : int, randomstate instance or none, optional (default=none)
+        if ``order='random'``, determines random number generation for the
+        chain order.
+        in addition, it controls the random seed given at each `base_estimator`
+        at each chaining iteration. thus, it is only used when `base_estimator`
+        exposes a `random_state`.
+        pass an int for reproducible output across multiple function calls.
+        see :term:`glossary <random_state>`.
+
+    attributes
+    ----------
+    classes_ : list
+        a list of arrays of length ``len(estimators_)`` containing the
+        class labels for each estimator in the chain.
+
+    estimators_ : list
+        a list of clones of base_estimator.
+
+    order_ : list
+        the order of labels in the classifier chain.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`. only defined if the
+        underlying `base_estimator` exposes such an attribute when fit.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    regressorchain : equivalent for regression.
+    multioutputclassifier : classifies each output independently rather than
+        chaining.
+
+    references
+    ----------
+    jesse read, bernhard pfahringer, geoff holmes, eibe frank, "classifier
+    chains for multi-label classification", 2009.
+
+    examples
+    --------
+    >>> from sklearn.datasets import make_multilabel_classification
+    >>> from sklearn.linear_model import logisticregression
+    >>> from sklearn.model_selection import train_test_split
+    >>> from sklearn.multioutput import classifierchain
+    >>> x, y = make_multilabel_classification(
+    ...    n_samples=12, n_classes=3, random_state=0
+    ... )
+    >>> x_train, x_test, y_train, y_test = train_test_split(
+    ...    x, y, random_state=0
+    ... )
+    >>> base_lr = logisticregression(solver='lbfgs', random_state=0)
+    >>> chain = classifierchain(base_lr, order='random', random_state=0)
+    >>> chain.fit(x_train, y_train).predict(x_test)
+    array([[1., 1., 0.],
+           [1., 0., 0.],
+           [0., 1., 0.]])
+    >>> chain.predict_proba(x_test)
+    array([[0.8387..., 0.9431..., 0.4576...],
+           [0.8878..., 0.3684..., 0.2640...],
+           [0.0321..., 0.9935..., 0.0625...]])
+    """
+
+    def fit(self, x, y):
+        """fit the model to data matrix x and targets y.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : array-like of shape (n_samples, n_classes)
+            the target values.
+
+        returns
+        -------
+        self : object
+            class instance.
+        """
+        super().fit(x, y)
+        self.classes_ = [
+            estimator.classes_ for chain_idx, estimator in enumerate(self.estimators_)
+        ]
+        return self
+
+    @_available_if_base_estimator_has("predict_proba")
+    def predict_proba(self, x):
+        """predict probability estimates.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        returns
+        -------
+        y_prob : array-like of shape (n_samples, n_classes)
+            the predicted probabilities.
+        """
+        x = self._validate_data(x, accept_sparse=true, reset=false)
+        y_prob_chain = np.zeros((x.shape[0], len(self.estimators_)))
+        y_pred_chain = np.zeros((x.shape[0], len(self.estimators_)))
+        for chain_idx, estimator in enumerate(self.estimators_):
+            previous_predictions = y_pred_chain[:, :chain_idx]
+            if sp.issparse(x):
+                x_aug = sp.hstack((x, previous_predictions))
+            else:
+                x_aug = np.hstack((x, previous_predictions))
+            y_prob_chain[:, chain_idx] = estimator.predict_proba(x_aug)[:, 1]
+            y_pred_chain[:, chain_idx] = estimator.predict(x_aug)
+        inv_order = np.empty_like(self.order_)
+        inv_order[self.order_] = np.arange(len(self.order_))
+        y_prob = y_prob_chain[:, inv_order]
+
+        return y_prob
+
+    @_available_if_base_estimator_has("decision_function")
+    def decision_function(self, x):
+        """evaluate the decision_function of the models in the chain.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            the input data.
+
+        returns
+        -------
+        y_decision : array-like of shape (n_samples, n_classes)
+            returns the decision function of the sample for each model
+            in the chain.
+        """
+        x = self._validate_data(x, accept_sparse=true, reset=false)
+        y_decision_chain = np.zeros((x.shape[0], len(self.estimators_)))
+        y_pred_chain = np.zeros((x.shape[0], len(self.estimators_)))
+        for chain_idx, estimator in enumerate(self.estimators_):
+            previous_predictions = y_pred_chain[:, :chain_idx]
+            if sp.issparse(x):
+                x_aug = sp.hstack((x, previous_predictions))
+            else:
+                x_aug = np.hstack((x, previous_predictions))
+            y_decision_chain[:, chain_idx] = estimator.decision_function(x_aug)
+            y_pred_chain[:, chain_idx] = estimator.predict(x_aug)
+
+        inv_order = np.empty_like(self.order_)
+        inv_order[self.order_] = np.arange(len(self.order_))
+        y_decision = y_decision_chain[:, inv_order]
+
+        return y_decision
+
+    def _more_tags(self):
+        return {"_skip_test": true, "multioutput_only": true}
+
+
+class regressorchain(metaestimatormixin, regressormixin, _basechain):
+    """a multi-label model that arranges regressions into a chain.
+
+    each model makes a prediction in the order specified by the chain using
+    all of the available features provided to the model plus the predictions
+    of models that are earlier in the chain.
+
+    read more in the :ref:`user guide <regressorchain>`.
+
+    .. versionadded:: 0.20
+
+    parameters
+    ----------
+    base_estimator : estimator
+        the base estimator from which the classifier chain is built.
+
+    order : array-like of shape (n_outputs,) or 'random', default=none
+        if `none`, the order will be determined by the order of columns in
+        the label matrix y.::
+
+            order = [0, 1, 2, ..., y.shape[1] - 1]
+
+        the order of the chain can be explicitly set by providing a list of
+        integers. for example, for a chain of length 5.::
+
+            order = [1, 3, 2, 4, 0]
+
+        means that the first model in the chain will make predictions for
+        column 1 in the y matrix, the second model will make predictions
+        for column 3, etc.
+
+        if order is 'random' a random ordering will be used.
+
+    cv : int, cross-validation generator or an iterable, default=none
+        determines whether to use cross validated predictions or true
+        labels for the results of previous estimators in the chain.
+        possible inputs for cv are:
+
+        - none, to use true labels when fitting,
+        - integer, to specify the number of folds in a (stratified)kfold,
+        - :term:`cv splitter`,
+        - an iterable yielding (train, test) splits as arrays of indices.
+
+    random_state : int, randomstate instance or none, optional (default=none)
+        if ``order='random'``, determines random number generation for the
+        chain order.
+        in addition, it controls the random seed given at each `base_estimator`
+        at each chaining iteration. thus, it is only used when `base_estimator`
+        exposes a `random_state`.
+        pass an int for reproducible output across multiple function calls.
+        see :term:`glossary <random_state>`.
+
+    attributes
+    ----------
+    estimators_ : list
+        a list of clones of base_estimator.
+
+    order_ : list
+        the order of labels in the classifier chain.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`. only defined if the
+        underlying `base_estimator` exposes such an attribute when fit.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    classifierchain : equivalent for classification.
+    multioutputregressor : learns each output independently rather than
+        chaining.
+
+    examples
+    --------
+    >>> from sklearn.multioutput import regressorchain
+    >>> from sklearn.linear_model import logisticregression
+    >>> logreg = logisticregression(solver='lbfgs',multi_class='multinomial')
+    >>> x, y = [[1, 0], [0, 1], [1, 1]], [[0, 2], [1, 1], [2, 0]]
+    >>> chain = regressorchain(base_estimator=logreg, order=[0, 1]).fit(x, y)
+    >>> chain.predict(x)
+    array([[0., 2.],
+           [1., 1.],
+           [2., 0.]])
+    """
+
+    def fit(self, x, y, **fit_params):
+        """fit the model to data matrix x and targets y.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            the input data.
+
+        y : array-like of shape (n_samples, n_classes)
+            the target values.
+
+        **fit_params : dict of string -> object
+            parameters passed to the `fit` method at each step
+            of the regressor chain.
+
+            .. versionadded:: 0.23
+
+        returns
+        -------
+        self : object
+            returns a fitted instance.
+        """
+        super().fit(x, y, **fit_params)
+        return self
+
+    def _more_tags(self):
+        return {"multioutput_only": true}import warnings
+
+from abc import abcmeta, abstractmethod
+
+
+import numpy as np
+from scipy.special import logsumexp
+
+from .base import baseestimator, classifiermixin
+from .preprocessing import binarize
+from .preprocessing import labelbinarizer
+from .preprocessing import label_binarize
+from .utils import deprecated
+from .utils.extmath import safe_sparse_dot
+from .utils.multiclass import _check_partial_fit_first_call
+from .utils.validation import check_is_fitted, check_non_negative
+from .utils.validation import _check_sample_weight
+
+
+__all__ = [
+    "bernoullinb",
+    "gaussiannb",
+    "multinomialnb",
+    "complementnb",
+    "categoricalnb",
+]
+
+
+class _basenb(classifiermixin, baseestimator, metaclass=abcmeta):
+    """abstract base class for naive bayes estimators"""
+
+    @abstractmethod
+    def _joint_log_likelihood(self, x):
+        """compute the unnormalized posterior log probability of x
+
+        i.e. ``log p(c) + log p(x|c)`` for all rows x of x, as an array-like of
+        shape (n_samples, n_classes).
+
+        predict, predict_proba, and predict_log_proba pass the input through
+        _check_x and handle it over to _joint_log_likelihood.
+        """
+
+    @abstractmethod
+    def _check_x(self, x):
+        """to be overridden in subclasses with the actual checks.
+
+        only used in predict* methods.
+        """
+
+    def predict(self, x):
+        """
+        perform classification on an array of test vectors x.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            the input samples.
+
+        returns
+        -------
+        c : ndarray of shape (n_samples,)
+            predicted target values for x.
+        """
+        check_is_fitted(self)
+        x = self._check_x(x)
+        jll = self._joint_log_likelihood(x)
+        return self.classes_[np.argmax(jll, axis=1)]
+
+    def predict_log_proba(self, x):
+        """
+        return log-probability estimates for the test vector x.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            the input samples.
+
+        returns
+        -------
+        c : array-like of shape (n_samples, n_classes)
+            returns the log-probability of the samples for each class in
+            the model. the columns correspond to the classes in sorted
+            order, as they appear in the attribute :term:`classes_`.
+        """
+        check_is_fitted(self)
+        x = self._check_x(x)
+        jll = self._joint_log_likelihood(x)
+        # normalize by p(x) = p(f_1, ..., f_n)
+        log_prob_x = logsumexp(jll, axis=1)
+        return jll - np.atleast_2d(log_prob_x).t
+
+    def predict_proba(self, x):
+        """
+        return probability estimates for the test vector x.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            the input samples.
+
+        returns
+        -------
+        c : array-like of shape (n_samples, n_classes)
+            returns the probability of the samples for each class in
+            the model. the columns correspond to the classes in sorted
+            order, as they appear in the attribute :term:`classes_`.
+        """
+        return np.exp(self.predict_log_proba(x))
+
+
+class gaussiannb(_basenb):
+    """
+    gaussian naive bayes (gaussiannb).
+
+    can perform online updates to model parameters via :meth:`partial_fit`.
+    for details on algorithm used to update feature means and variance online,
+    see stanford cs tech report stan-cs-79-773 by chan, golub, and leveque:
+
+        http://i.stanford.edu/pub/cstr/reports/cs/tr/79/773/cs-tr-79-773.pdf
+
+    read more in the :ref:`user guide <gaussian_naive_bayes>`.
+
+    parameters
+    ----------
+    priors : array-like of shape (n_classes,)
+        prior probabilities of the classes. if specified, the priors are not
+        adjusted according to the data.
+
+    var_smoothing : float, default=1e-9
+        portion of the largest variance of all features that is added to
+        variances for calculation stability.
+
+        .. versionadded:: 0.20
+
+    attributes
+    ----------
+    class_count_ : ndarray of shape (n_classes,)
+        number of training samples observed in each class.
+
+    class_prior_ : ndarray of shape (n_classes,)
+        probability of each class.
+
+    classes_ : ndarray of shape (n_classes,)
+        class labels known to the classifier.
+
+    epsilon_ : float
+        absolute additive value to variances.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    sigma_ : ndarray of shape (n_classes, n_features)
+        variance of each feature per class.
+
+        .. deprecated:: 1.0
+           `sigma_` is deprecated in 1.0 and will be removed in 1.2.
+           use `var_` instead.
+
+    var_ : ndarray of shape (n_classes, n_features)
+        variance of each feature per class.
+
+        .. versionadded:: 1.0
+
+    theta_ : ndarray of shape (n_classes, n_features)
+        mean of each feature per class.
+
+    see also
+    --------
+    bernoullinb : naive bayes classifier for multivariate bernoulli models.
+    categoricalnb : naive bayes classifier for categorical features.
+    complementnb : complement naive bayes classifier.
+    multinomialnb : naive bayes classifier for multinomial models.
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> x = np.array([[-1, -1], [-2, -1], [-3, -2], [1, 1], [2, 1], [3, 2]])
+    >>> y = np.array([1, 1, 1, 2, 2, 2])
+    >>> from sklearn.naive_bayes import gaussiannb
+    >>> clf = gaussiannb()
+    >>> clf.fit(x, y)
+    gaussiannb()
+    >>> print(clf.predict([[-0.8, -1]]))
+    [1]
+    >>> clf_pf = gaussiannb()
+    >>> clf_pf.partial_fit(x, y, np.unique(y))
+    gaussiannb()
+    >>> print(clf_pf.predict([[-0.8, -1]]))
+    [1]
+    """
+
+    def __init__(self, *, priors=none, var_smoothing=1e-9):
+        self.priors = priors
+        self.var_smoothing = var_smoothing
+
+    def fit(self, x, y, sample_weight=none):
+        """fit gaussian naive bayes according to x, y.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples
+            and `n_features` is the number of features.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+            .. versionadded:: 0.17
+               gaussian naive bayes supports fitting with *sample_weight*.
+
+        returns
+        -------
+        self : object
+            returns the instance itself.
+        """
+        y = self._validate_data(y=y)
+        return self._partial_fit(
+            x, y, np.unique(y), _refit=true, sample_weight=sample_weight
+        )
+
+    def _check_x(self, x):
+        """validate x, used only in predict* methods."""
+        return self._validate_data(x, reset=false)
+
+    @staticmethod
+    def _update_mean_variance(n_past, mu, var, x, sample_weight=none):
+        """compute online update of gaussian mean and variance.
+
+        given starting sample count, mean, and variance, a new set of
+        points x, and optionally sample weights, return the updated mean and
+        variance. (nb - each dimension (column) in x is treated as independent
+        -- you get variance, not covariance).
+
+        can take scalar mean and variance, or vector mean and variance to
+        simultaneously update a number of independent gaussians.
+
+        see stanford cs tech report stan-cs-79-773 by chan, golub, and leveque:
+
+        http://i.stanford.edu/pub/cstr/reports/cs/tr/79/773/cs-tr-79-773.pdf
+
+        parameters
+        ----------
+        n_past : int
+            number of samples represented in old mean and variance. if sample
+            weights were given, this should contain the sum of sample
+            weights represented in old mean and variance.
+
+        mu : array-like of shape (number of gaussians,)
+            means for gaussians in original set.
+
+        var : array-like of shape (number of gaussians,)
+            variances for gaussians in original set.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+        returns
+        -------
+        total_mu : array-like of shape (number of gaussians,)
+            updated mean for each gaussian over the combined set.
+
+        total_var : array-like of shape (number of gaussians,)
+            updated variance for each gaussian over the combined set.
+        """
+        if x.shape[0] == 0:
+            return mu, var
+
+        # compute (potentially weighted) mean and variance of new datapoints
+        if sample_weight is not none:
+            n_new = float(sample_weight.sum())
+            new_mu = np.average(x, axis=0, weights=sample_weight)
+            new_var = np.average((x - new_mu) ** 2, axis=0, weights=sample_weight)
+        else:
+            n_new = x.shape[0]
+            new_var = np.var(x, axis=0)
+            new_mu = np.mean(x, axis=0)
+
+        if n_past == 0:
+            return new_mu, new_var
+
+        n_total = float(n_past + n_new)
+
+        # combine mean of old and new data, taking into consideration
+        # (weighted) number of observations
+        total_mu = (n_new * new_mu + n_past * mu) / n_total
+
+        # combine variance of old and new data, taking into consideration
+        # (weighted) number of observations. this is achieved by combining
+        # the sum-of-squared-differences (ssd)
+        old_ssd = n_past * var
+        new_ssd = n_new * new_var
+        total_ssd = old_ssd + new_ssd + (n_new * n_past / n_total) * (mu - new_mu) ** 2
+        total_var = total_ssd / n_total
+
+        return total_mu, total_var
+
+    def partial_fit(self, x, y, classes=none, sample_weight=none):
+        """incremental fit on a batch of samples.
+
+        this method is expected to be called several times consecutively
+        on different chunks of a dataset so as to implement out-of-core
+        or online learning.
+
+        this is especially useful when the whole dataset is too big to fit in
+        memory at once.
+
+        this method has some performance and numerical stability overhead,
+        hence it is better to call partial_fit on chunks of data that are
+        as large as possible (as long as fitting in the memory budget) to
+        hide the overhead.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples and
+            `n_features` is the number of features.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        classes : array-like of shape (n_classes,), default=none
+            list of all the classes that can possibly appear in the y vector.
+
+            must be provided at the first call to partial_fit, can be omitted
+            in subsequent calls.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+            .. versionadded:: 0.17
+
+        returns
+        -------
+        self : object
+            returns the instance itself.
+        """
+        return self._partial_fit(
+            x, y, classes, _refit=false, sample_weight=sample_weight
+        )
+
+    def _partial_fit(self, x, y, classes=none, _refit=false, sample_weight=none):
+        """actual implementation of gaussian nb fitting.
+
+        parameters
+        ----------
+        x : array-like of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples and
+            `n_features` is the number of features.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        classes : array-like of shape (n_classes,), default=none
+            list of all the classes that can possibly appear in the y vector.
+
+            must be provided at the first call to partial_fit, can be omitted
+            in subsequent calls.
+
+        _refit : bool, default=false
+            if true, act as though this were the first time we called
+            _partial_fit (ie, throw away any past fitting and start over).
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+        returns
+        -------
+        self : object
+        """
+        if _refit:
+            self.classes_ = none
+
+        first_call = _check_partial_fit_first_call(self, classes)
+        x, y = self._validate_data(x, y, reset=first_call)
+        if sample_weight is not none:
+            sample_weight = _check_sample_weight(sample_weight, x)
+
+        # if the ratio of data variance between dimensions is too small, it
+        # will cause numerical errors. to address this, we artificially
+        # boost the variance by epsilon, a small fraction of the standard
+        # deviation of the largest dimension.
+        self.epsilon_ = self.var_smoothing * np.var(x, axis=0).max()
+
+        if first_call:
+            # this is the first call to partial_fit:
+            # initialize various cumulative counters
+            n_features = x.shape[1]
+            n_classes = len(self.classes_)
+            self.theta_ = np.zeros((n_classes, n_features))
+            self.var_ = np.zeros((n_classes, n_features))
+
+            self.class_count_ = np.zeros(n_classes, dtype=np.float64)
+
+            # initialise the class prior
+            # take into account the priors
+            if self.priors is not none:
+                priors = np.asarray(self.priors)
+                # check that the provided prior matches the number of classes
+                if len(priors) != n_classes:
+                    raise valueerror("number of priors must match number of classes.")
+                # check that the sum is 1
+                if not np.isclose(priors.sum(), 1.0):
+                    raise valueerror("the sum of the priors should be 1.")
+                # check that the priors are non-negative
+                if (priors < 0).any():
+                    raise valueerror("priors must be non-negative.")
+                self.class_prior_ = priors
+            else:
+                # initialize the priors to zeros for each class
+                self.class_prior_ = np.zeros(len(self.classes_), dtype=np.float64)
+        else:
+            if x.shape[1] != self.theta_.shape[1]:
+                msg = "number of features %d does not match previous data %d."
+                raise valueerror(msg % (x.shape[1], self.theta_.shape[1]))
+            # put epsilon back in each time
+            self.var_[:, :] -= self.epsilon_
+
+        classes = self.classes_
+
+        unique_y = np.unique(y)
+        unique_y_in_classes = np.in1d(unique_y, classes)
+
+        if not np.all(unique_y_in_classes):
+            raise valueerror(
+                "the target label(s) %s in y do not exist in the initial classes %s"
+                % (unique_y[~unique_y_in_classes], classes)
+            )
+
+        for y_i in unique_y:
+            i = classes.searchsorted(y_i)
+            x_i = x[y == y_i, :]
+
+            if sample_weight is not none:
+                sw_i = sample_weight[y == y_i]
+                n_i = sw_i.sum()
+            else:
+                sw_i = none
+                n_i = x_i.shape[0]
+
+            new_theta, new_sigma = self._update_mean_variance(
+                self.class_count_[i], self.theta_[i, :], self.var_[i, :], x_i, sw_i
+            )
+
+            self.theta_[i, :] = new_theta
+            self.var_[i, :] = new_sigma
+            self.class_count_[i] += n_i
+
+        self.var_[:, :] += self.epsilon_
+
+        # update if only no priors is provided
+        if self.priors is none:
+            # empirical prior, with sample_weight taken into account
+            self.class_prior_ = self.class_count_ / self.class_count_.sum()
+
+        return self
+
+    def _joint_log_likelihood(self, x):
+        joint_log_likelihood = []
+        for i in range(np.size(self.classes_)):
+            jointi = np.log(self.class_prior_[i])
+            n_ij = -0.5 * np.sum(np.log(2.0 * np.pi * self.var_[i, :]))
+            n_ij -= 0.5 * np.sum(((x - self.theta_[i, :]) ** 2) / (self.var_[i, :]), 1)
+            joint_log_likelihood.append(jointi + n_ij)
+
+        joint_log_likelihood = np.array(joint_log_likelihood).t
+        return joint_log_likelihood
+
+    @deprecated(  # type: ignore
+        "attribute `sigma_` was deprecated in 1.0 and will be removed in"
+        "1.2. use `var_` instead."
+    )
+    @property
+    def sigma_(self):
+        return self.var_
+
+
+_alpha_min = 1e-10
+
+
+class _basediscretenb(_basenb):
+    """abstract base class for naive bayes on discrete/categorical data
+
+    any estimator based on this class should provide:
+
+    __init__
+    _joint_log_likelihood(x) as per _basenb
+    _update_feature_log_prob(alpha)
+    _count(x, y)
+    """
+
+    @abstractmethod
+    def _count(self, x, y):
+        """update counts that are used to calculate probabilities.
+
+        the counts make up a sufficient statistic extracted from the data.
+        accordingly, this method is called each time `fit` or `partial_fit`
+        update the model. `class_count_` and `feature_count_` must be updated
+        here along with any model specific counts.
+
+        parameters
+        ----------
+        x : {ndarray, sparse matrix} of shape (n_samples, n_features)
+            the input samples.
+        y : ndarray of shape (n_samples, n_classes)
+            binarized class labels.
+        """
+
+    @abstractmethod
+    def _update_feature_log_prob(self, alpha):
+        """update feature log probabilities based on counts.
+
+        this method is called each time `fit` or `partial_fit` update the
+        model.
+
+        parameters
+        ----------
+        alpha : float
+            smoothing parameter. see :meth:`_check_alpha`.
+        """
+
+    def _check_x(self, x):
+        """validate x, used only in predict* methods."""
+        return self._validate_data(x, accept_sparse="csr", reset=false)
+
+    def _check_x_y(self, x, y, reset=true):
+        """validate x and y in fit methods."""
+        return self._validate_data(x, y, accept_sparse="csr", reset=reset)
+
+    def _update_class_log_prior(self, class_prior=none):
+        """update class log priors.
+
+        the class log priors are based on `class_prior`, class count or the
+        number of classes. this method is called each time `fit` or
+        `partial_fit` update the model.
+        """
+        n_classes = len(self.classes_)
+        if class_prior is not none:
+            if len(class_prior) != n_classes:
+                raise valueerror("number of priors must match number of classes.")
+            self.class_log_prior_ = np.log(class_prior)
+        elif self.fit_prior:
+            with warnings.catch_warnings():
+                # silence the warning when count is 0 because class was not yet
+                # observed
+                warnings.simplefilter("ignore", runtimewarning)
+                log_class_count = np.log(self.class_count_)
+
+            # empirical prior, with sample_weight taken into account
+            self.class_log_prior_ = log_class_count - np.log(self.class_count_.sum())
+        else:
+            self.class_log_prior_ = np.full(n_classes, -np.log(n_classes))
+
+    def _check_alpha(self):
+        if np.min(self.alpha) < 0:
+            raise valueerror(
+                "smoothing parameter alpha = %.1e. alpha should be > 0."
+                % np.min(self.alpha)
+            )
+        if isinstance(self.alpha, np.ndarray):
+            if not self.alpha.shape[0] == self.n_features_in_:
+                raise valueerror(
+                    "alpha should be a scalar or a numpy array with shape [n_features]"
+                )
+        if np.min(self.alpha) < _alpha_min:
+            warnings.warn(
+                "alpha too small will result in numeric errors, setting alpha = %.1e"
+                % _alpha_min
+            )
+            return np.maximum(self.alpha, _alpha_min)
+        return self.alpha
+
+    def partial_fit(self, x, y, classes=none, sample_weight=none):
+        """incremental fit on a batch of samples.
+
+        this method is expected to be called several times consecutively
+        on different chunks of a dataset so as to implement out-of-core
+        or online learning.
+
+        this is especially useful when the whole dataset is too big to fit in
+        memory at once.
+
+        this method has some performance overhead hence it is better to call
+        partial_fit on chunks of data that are as large as possible
+        (as long as fitting in the memory budget) to hide the overhead.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples and
+            `n_features` is the number of features.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        classes : array-like of shape (n_classes,), default=none
+            list of all the classes that can possibly appear in the y vector.
+
+            must be provided at the first call to partial_fit, can be omitted
+            in subsequent calls.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+        returns
+        -------
+        self : object
+            returns the instance itself.
+        """
+        first_call = not hasattr(self, "classes_")
+        x, y = self._check_x_y(x, y, reset=first_call)
+        _, n_features = x.shape
+
+        if _check_partial_fit_first_call(self, classes):
+            # this is the first call to partial_fit:
+            # initialize various cumulative counters
+            n_classes = len(classes)
+            self._init_counters(n_classes, n_features)
+
+        y = label_binarize(y, classes=self.classes_)
+        if y.shape[1] == 1:
+            if len(self.classes_) == 2:
+                y = np.concatenate((1 - y, y), axis=1)
+            else:  # degenerate case: just one class
+                y = np.ones_like(y)
+
+        if x.shape[0] != y.shape[0]:
+            msg = "x.shape[0]=%d and y.shape[0]=%d are incompatible."
+            raise valueerror(msg % (x.shape[0], y.shape[0]))
+
+        # label_binarize() returns arrays with dtype=np.int64.
+        # we convert it to np.float64 to support sample_weight consistently
+        y = y.astype(np.float64, copy=false)
+        if sample_weight is not none:
+            sample_weight = _check_sample_weight(sample_weight, x)
+            sample_weight = np.atleast_2d(sample_weight)
+            y *= sample_weight.t
+
+        class_prior = self.class_prior
+
+        # count raw events from data before updating the class log prior
+        # and feature log probas
+        self._count(x, y)
+
+        # xxx: optim: we could introduce a public finalization method to
+        # be called by the user explicitly just once after several consecutive
+        # calls to partial_fit and prior any call to predict[_[log_]proba]
+        # to avoid computing the smooth log probas at each call to partial fit
+        alpha = self._check_alpha()
+        self._update_feature_log_prob(alpha)
+        self._update_class_log_prior(class_prior=class_prior)
+        return self
+
+    def fit(self, x, y, sample_weight=none):
+        """fit naive bayes classifier according to x, y.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples and
+            `n_features` is the number of features.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+        returns
+        -------
+        self : object
+            returns the instance itself.
+        """
+        x, y = self._check_x_y(x, y)
+        _, n_features = x.shape
+
+        labelbin = labelbinarizer()
+        y = labelbin.fit_transform(y)
+        self.classes_ = labelbin.classes_
+        if y.shape[1] == 1:
+            if len(self.classes_) == 2:
+                y = np.concatenate((1 - y, y), axis=1)
+            else:  # degenerate case: just one class
+                y = np.ones_like(y)
+
+        # labelbinarizer().fit_transform() returns arrays with dtype=np.int64.
+        # we convert it to np.float64 to support sample_weight consistently;
+        # this means we also don't have to cast x to floating point
+        if sample_weight is not none:
+            y = y.astype(np.float64, copy=false)
+            sample_weight = _check_sample_weight(sample_weight, x)
+            sample_weight = np.atleast_2d(sample_weight)
+            y *= sample_weight.t
+
+        class_prior = self.class_prior
+
+        # count raw events from data before updating the class log prior
+        # and feature log probas
+        n_classes = y.shape[1]
+        self._init_counters(n_classes, n_features)
+        self._count(x, y)
+        alpha = self._check_alpha()
+        self._update_feature_log_prob(alpha)
+        self._update_class_log_prior(class_prior=class_prior)
+        return self
+
+    def _init_counters(self, n_classes, n_features):
+        self.class_count_ = np.zeros(n_classes, dtype=np.float64)
+        self.feature_count_ = np.zeros((n_classes, n_features), dtype=np.float64)
+
+    def _more_tags(self):
+        return {"poor_score": true}
+
+    # todo: remove in 1.2
+    # mypy error: decorated property not supported
+    @deprecated(  # type: ignore
+        "attribute `n_features_` was deprecated in version 1.0 and will be "
+        "removed in 1.2. use `n_features_in_` instead."
+    )
+    @property
+    def n_features_(self):
+        return self.n_features_in_
+
+
+class multinomialnb(_basediscretenb):
+    """
+    naive bayes classifier for multinomial models.
+
+    the multinomial naive bayes classifier is suitable for classification with
+    discrete features (e.g., word counts for text classification). the
+    multinomial distribution normally requires integer feature counts. however,
+    in practice, fractional counts such as tf-idf may also work.
+
+    read more in the :ref:`user guide <multinomial_naive_bayes>`.
+
+    parameters
+    ----------
+    alpha : float, default=1.0
+        additive (laplace/lidstone) smoothing parameter
+        (0 for no smoothing).
+
+    fit_prior : bool, default=true
+        whether to learn class prior probabilities or not.
+        if false, a uniform prior will be used.
+
+    class_prior : array-like of shape (n_classes,), default=none
+        prior probabilities of the classes. if specified, the priors are not
+        adjusted according to the data.
+
+    attributes
+    ----------
+    class_count_ : ndarray of shape (n_classes,)
+        number of samples encountered for each class during fitting. this
+        value is weighted by the sample weight when provided.
+
+    class_log_prior_ : ndarray of shape (n_classes,)
+        smoothed empirical log probability for each class.
+
+    classes_ : ndarray of shape (n_classes,)
+        class labels known to the classifier
+
+    feature_count_ : ndarray of shape (n_classes, n_features)
+        number of samples encountered for each (class, feature)
+        during fitting. this value is weighted by the sample weight when
+        provided.
+
+    feature_log_prob_ : ndarray of shape (n_classes, n_features)
+        empirical log probability of features
+        given a class, ``p(x_i|y)``.
+
+    n_features_ : int
+        number of features of each sample.
+
+        .. deprecated:: 1.0
+            attribute `n_features_` was deprecated in version 1.0 and will be
+            removed in 1.2. use `n_features_in_` instead.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    bernoullinb : naive bayes classifier for multivariate bernoulli models.
+    categoricalnb : naive bayes classifier for categorical features.
+    complementnb : complement naive bayes classifier.
+    gaussiannb : gaussian naive bayes.
+
+    references
+    ----------
+    c.d. manning, p. raghavan and h. schuetze (2008). introduction to
+    information retrieval. cambridge university press, pp. 234-265.
+    https://nlp.stanford.edu/ir-book/html/htmledition/naive-bayes-text-classification-1.html
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.randomstate(1)
+    >>> x = rng.randint(5, size=(6, 100))
+    >>> y = np.array([1, 2, 3, 4, 5, 6])
+    >>> from sklearn.naive_bayes import multinomialnb
+    >>> clf = multinomialnb()
+    >>> clf.fit(x, y)
+    multinomialnb()
+    >>> print(clf.predict(x[2:3]))
+    [3]
+    """
+
+    def __init__(self, *, alpha=1.0, fit_prior=true, class_prior=none):
+        self.alpha = alpha
+        self.fit_prior = fit_prior
+        self.class_prior = class_prior
+
+    def _more_tags(self):
+        return {"requires_positive_x": true}
+
+    def _count(self, x, y):
+        """count and smooth feature occurrences."""
+        check_non_negative(x, "multinomialnb (input x)")
+        self.feature_count_ += safe_sparse_dot(y.t, x)
+        self.class_count_ += y.sum(axis=0)
+
+    def _update_feature_log_prob(self, alpha):
+        """apply smoothing to raw counts and recompute log probabilities"""
+        smoothed_fc = self.feature_count_ + alpha
+        smoothed_cc = smoothed_fc.sum(axis=1)
+
+        self.feature_log_prob_ = np.log(smoothed_fc) - np.log(
+            smoothed_cc.reshape(-1, 1)
+        )
+
+    def _joint_log_likelihood(self, x):
+        """calculate the posterior log probability of the samples x"""
+        return safe_sparse_dot(x, self.feature_log_prob_.t) + self.class_log_prior_
+
+
+class complementnb(_basediscretenb):
+    """the complement naive bayes classifier described in rennie et al. (2003).
+
+    the complement naive bayes classifier was designed to correct the "severe
+    assumptions" made by the standard multinomial naive bayes classifier. it is
+    particularly suited for imbalanced data sets.
+
+    read more in the :ref:`user guide <complement_naive_bayes>`.
+
+    .. versionadded:: 0.20
+
+    parameters
+    ----------
+    alpha : float, default=1.0
+        additive (laplace/lidstone) smoothing parameter (0 for no smoothing).
+
+    fit_prior : bool, default=true
+        only used in edge case with a single class in the training set.
+
+    class_prior : array-like of shape (n_classes,), default=none
+        prior probabilities of the classes. not used.
+
+    norm : bool, default=false
+        whether or not a second normalization of the weights is performed. the
+        default behavior mirrors the implementations found in mahout and weka,
+        which do not follow the full algorithm described in table 9 of the
+        paper.
+
+    attributes
+    ----------
+    class_count_ : ndarray of shape (n_classes,)
+        number of samples encountered for each class during fitting. this
+        value is weighted by the sample weight when provided.
+
+    class_log_prior_ : ndarray of shape (n_classes,)
+        smoothed empirical log probability for each class. only used in edge
+        case with a single class in the training set.
+
+    classes_ : ndarray of shape (n_classes,)
+        class labels known to the classifier
+
+    feature_all_ : ndarray of shape (n_features,)
+        number of samples encountered for each feature during fitting. this
+        value is weighted by the sample weight when provided.
+
+    feature_count_ : ndarray of shape (n_classes, n_features)
+        number of samples encountered for each (class, feature) during fitting.
+        this value is weighted by the sample weight when provided.
+
+    feature_log_prob_ : ndarray of shape (n_classes, n_features)
+        empirical weights for class complements.
+
+    n_features_ : int
+        number of features of each sample.
+
+        .. deprecated:: 1.0
+            attribute `n_features_` was deprecated in version 1.0 and will be
+            removed in 1.2. use `n_features_in_` instead.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    bernoullinb : naive bayes classifier for multivariate bernoulli models.
+    categoricalnb : naive bayes classifier for categorical features.
+    gaussiannb : gaussian naive bayes.
+    multinomialnb : naive bayes classifier for multinomial models.
+
+    references
+    ----------
+    rennie, j. d., shih, l., teevan, j., & karger, d. r. (2003).
+    tackling the poor assumptions of naive bayes text classifiers. in icml
+    (vol. 3, pp. 616-623).
+    https://people.csail.mit.edu/jrennie/papers/icml03-nb.pdf
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.randomstate(1)
+    >>> x = rng.randint(5, size=(6, 100))
+    >>> y = np.array([1, 2, 3, 4, 5, 6])
+    >>> from sklearn.naive_bayes import complementnb
+    >>> clf = complementnb()
+    >>> clf.fit(x, y)
+    complementnb()
+    >>> print(clf.predict(x[2:3]))
+    [3]
+    """
+
+    def __init__(self, *, alpha=1.0, fit_prior=true, class_prior=none, norm=false):
+        self.alpha = alpha
+        self.fit_prior = fit_prior
+        self.class_prior = class_prior
+        self.norm = norm
+
+    def _more_tags(self):
+        return {"requires_positive_x": true}
+
+    def _count(self, x, y):
+        """count feature occurrences."""
+        check_non_negative(x, "complementnb (input x)")
+        self.feature_count_ += safe_sparse_dot(y.t, x)
+        self.class_count_ += y.sum(axis=0)
+        self.feature_all_ = self.feature_count_.sum(axis=0)
+
+    def _update_feature_log_prob(self, alpha):
+        """apply smoothing to raw counts and compute the weights."""
+        comp_count = self.feature_all_ + alpha - self.feature_count_
+        logged = np.log(comp_count / comp_count.sum(axis=1, keepdims=true))
+        # _basenb.predict uses argmax, but complementnb operates with argmin.
+        if self.norm:
+            summed = logged.sum(axis=1, keepdims=true)
+            feature_log_prob = logged / summed
+        else:
+            feature_log_prob = -logged
+        self.feature_log_prob_ = feature_log_prob
+
+    def _joint_log_likelihood(self, x):
+        """calculate the class scores for the samples in x."""
+        jll = safe_sparse_dot(x, self.feature_log_prob_.t)
+        if len(self.classes_) == 1:
+            jll += self.class_log_prior_
+        return jll
+
+
+class bernoullinb(_basediscretenb):
+    """naive bayes classifier for multivariate bernoulli models.
+
+    like multinomialnb, this classifier is suitable for discrete data. the
+    difference is that while multinomialnb works with occurrence counts,
+    bernoullinb is designed for binary/boolean features.
+
+    read more in the :ref:`user guide <bernoulli_naive_bayes>`.
+
+    parameters
+    ----------
+    alpha : float, default=1.0
+        additive (laplace/lidstone) smoothing parameter
+        (0 for no smoothing).
+
+    binarize : float or none, default=0.0
+        threshold for binarizing (mapping to booleans) of sample features.
+        if none, input is presumed to already consist of binary vectors.
+
+    fit_prior : bool, default=true
+        whether to learn class prior probabilities or not.
+        if false, a uniform prior will be used.
+
+    class_prior : array-like of shape (n_classes,), default=none
+        prior probabilities of the classes. if specified, the priors are not
+        adjusted according to the data.
+
+    attributes
+    ----------
+    class_count_ : ndarray of shape (n_classes,)
+        number of samples encountered for each class during fitting. this
+        value is weighted by the sample weight when provided.
+
+    class_log_prior_ : ndarray of shape (n_classes,)
+        log probability of each class (smoothed).
+
+    classes_ : ndarray of shape (n_classes,)
+        class labels known to the classifier
+
+    feature_count_ : ndarray of shape (n_classes, n_features)
+        number of samples encountered for each (class, feature)
+        during fitting. this value is weighted by the sample weight when
+        provided.
+
+    feature_log_prob_ : ndarray of shape (n_classes, n_features)
+        empirical log probability of features given a class, p(x_i|y).
+
+    n_features_ : int
+        number of features of each sample.
+
+        .. deprecated:: 1.0
+            attribute `n_features_` was deprecated in version 1.0 and will be
+            removed in 1.2. use `n_features_in_` instead.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    see also
+    --------
+    categoricalnb : naive bayes classifier for categorical features.
+    complementnb : the complement naive bayes classifier
+        described in rennie et al. (2003).
+    gaussiannb : gaussian naive bayes (gaussiannb).
+    multinomialnb : naive bayes classifier for multinomial models.
+
+    references
+    ----------
+    c.d. manning, p. raghavan and h. schuetze (2008). introduction to
+    information retrieval. cambridge university press, pp. 234-265.
+    https://nlp.stanford.edu/ir-book/html/htmledition/the-bernoulli-model-1.html
+
+    a. mccallum and k. nigam (1998). a comparison of event models for naive
+    bayes text classification. proc. aaai/icml-98 workshop on learning for
+    text categorization, pp. 41-48.
+
+    v. metsis, i. androutsopoulos and g. paliouras (2006). spam filtering with
+    naive bayes -- which naive bayes? 3rd conf. on email and anti-spam (ceas).
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.randomstate(1)
+    >>> x = rng.randint(5, size=(6, 100))
+    >>> y = np.array([1, 2, 3, 4, 4, 5])
+    >>> from sklearn.naive_bayes import bernoullinb
+    >>> clf = bernoullinb()
+    >>> clf.fit(x, y)
+    bernoullinb()
+    >>> print(clf.predict(x[2:3]))
+    [3]
+    """
+
+    def __init__(self, *, alpha=1.0, binarize=0.0, fit_prior=true, class_prior=none):
+        self.alpha = alpha
+        self.binarize = binarize
+        self.fit_prior = fit_prior
+        self.class_prior = class_prior
+
+    def _check_x(self, x):
+        """validate x, used only in predict* methods."""
+        x = super()._check_x(x)
+        if self.binarize is not none:
+            x = binarize(x, threshold=self.binarize)
+        return x
+
+    def _check_x_y(self, x, y, reset=true):
+        x, y = super()._check_x_y(x, y, reset=reset)
+        if self.binarize is not none:
+            x = binarize(x, threshold=self.binarize)
+        return x, y
+
+    def _count(self, x, y):
+        """count and smooth feature occurrences."""
+        self.feature_count_ += safe_sparse_dot(y.t, x)
+        self.class_count_ += y.sum(axis=0)
+
+    def _update_feature_log_prob(self, alpha):
+        """apply smoothing to raw counts and recompute log probabilities"""
+        smoothed_fc = self.feature_count_ + alpha
+        smoothed_cc = self.class_count_ + alpha * 2
+
+        self.feature_log_prob_ = np.log(smoothed_fc) - np.log(
+            smoothed_cc.reshape(-1, 1)
+        )
+
+    def _joint_log_likelihood(self, x):
+        """calculate the posterior log probability of the samples x"""
+        n_features = self.feature_log_prob_.shape[1]
+        n_features_x = x.shape[1]
+
+        if n_features_x != n_features:
+            raise valueerror(
+                "expected input with %d features, got %d instead"
+                % (n_features, n_features_x)
+            )
+
+        neg_prob = np.log(1 - np.exp(self.feature_log_prob_))
+        # compute  neg_prob · (1 - x).t  as  ∑neg_prob - x · neg_prob
+        jll = safe_sparse_dot(x, (self.feature_log_prob_ - neg_prob).t)
+        jll += self.class_log_prior_ + neg_prob.sum(axis=1)
+
+        return jll
+
+
+class categoricalnb(_basediscretenb):
+    """naive bayes classifier for categorical features.
+
+    the categorical naive bayes classifier is suitable for classification with
+    discrete features that are categorically distributed. the categories of
+    each feature are drawn from a categorical distribution.
+
+    read more in the :ref:`user guide <categorical_naive_bayes>`.
+
+    parameters
+    ----------
+    alpha : float, default=1.0
+        additive (laplace/lidstone) smoothing parameter
+        (0 for no smoothing).
+
+    fit_prior : bool, default=true
+        whether to learn class prior probabilities or not.
+        if false, a uniform prior will be used.
+
+    class_prior : array-like of shape (n_classes,), default=none
+        prior probabilities of the classes. if specified, the priors are not
+        adjusted according to the data.
+
+    min_categories : int or array-like of shape (n_features,), default=none
+        minimum number of categories per feature.
+
+        - integer: sets the minimum number of categories per feature to
+          `n_categories` for each features.
+        - array-like: shape (n_features,) where `n_categories[i]` holds the
+          minimum number of categories for the ith column of the input.
+        - none (default): determines the number of categories automatically
+          from the training data.
+
+        .. versionadded:: 0.24
+
+    attributes
+    ----------
+    category_count_ : list of arrays of shape (n_features,)
+        holds arrays of shape (n_classes, n_categories of respective feature)
+        for each feature. each array provides the number of samples
+        encountered for each class and category of the specific feature.
+
+    class_count_ : ndarray of shape (n_classes,)
+        number of samples encountered for each class during fitting. this
+        value is weighted by the sample weight when provided.
+
+    class_log_prior_ : ndarray of shape (n_classes,)
+        smoothed empirical log probability for each class.
+
+    classes_ : ndarray of shape (n_classes,)
+        class labels known to the classifier
+
+    feature_log_prob_ : list of arrays of shape (n_features,)
+        holds arrays of shape (n_classes, n_categories of respective feature)
+        for each feature. each array provides the empirical log probability
+        of categories given the respective feature and class, ``p(x_i|y)``.
+
+    n_features_ : int
+        number of features of each sample.
+
+        .. deprecated:: 1.0
+            attribute `n_features_` was deprecated in version 1.0 and will be
+            removed in 1.2. use `n_features_in_` instead.
+
+    n_features_in_ : int
+        number of features seen during :term:`fit`.
+
+        .. versionadded:: 0.24
+
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        names of features seen during :term:`fit`. defined only when `x`
+        has feature names that are all strings.
+
+        .. versionadded:: 1.0
+
+    n_categories_ : ndarray of shape (n_features,), dtype=np.int64
+        number of categories for each feature. this value is
+        inferred from the data or set by the minimum number of categories.
+
+        .. versionadded:: 0.24
+
+    see also
+    --------
+    bernoullinb : naive bayes classifier for multivariate bernoulli models.
+    complementnb : complement naive bayes classifier.
+    gaussiannb : gaussian naive bayes.
+    multinomialnb : naive bayes classifier for multinomial models.
+
+    examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.randomstate(1)
+    >>> x = rng.randint(5, size=(6, 100))
+    >>> y = np.array([1, 2, 3, 4, 5, 6])
+    >>> from sklearn.naive_bayes import categoricalnb
+    >>> clf = categoricalnb()
+    >>> clf.fit(x, y)
+    categoricalnb()
+    >>> print(clf.predict(x[2:3]))
+    [3]
+    """
+
+    def __init__(
+        self, *, alpha=1.0, fit_prior=true, class_prior=none, min_categories=none
+    ):
+        self.alpha = alpha
+        self.fit_prior = fit_prior
+        self.class_prior = class_prior
+        self.min_categories = min_categories
+
+    def fit(self, x, y, sample_weight=none):
+        """fit naive bayes classifier according to x, y.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples and
+            `n_features` is the number of features. here, each feature of x is
+            assumed to be from a different categorical distribution.
+            it is further assumed that all categories of each feature are
+            represented by the numbers 0, ..., n - 1, where n refers to the
+            total number of categories for the given feature. this can, for
+            instance, be achieved with the help of ordinalencoder.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+        returns
+        -------
+        self : object
+            returns the instance itself.
+        """
+        return super().fit(x, y, sample_weight=sample_weight)
+
+    def partial_fit(self, x, y, classes=none, sample_weight=none):
+        """incremental fit on a batch of samples.
+
+        this method is expected to be called several times consecutively
+        on different chunks of a dataset so as to implement out-of-core
+        or online learning.
+
+        this is especially useful when the whole dataset is too big to fit in
+        memory at once.
+
+        this method has some performance overhead hence it is better to call
+        partial_fit on chunks of data that are as large as possible
+        (as long as fitting in the memory budget) to hide the overhead.
+
+        parameters
+        ----------
+        x : {array-like, sparse matrix} of shape (n_samples, n_features)
+            training vectors, where `n_samples` is the number of samples and
+            `n_features` is the number of features. here, each feature of x is
+            assumed to be from a different categorical distribution.
+            it is further assumed that all categories of each feature are
+            represented by the numbers 0, ..., n - 1, where n refers to the
+            total number of categories for the given feature. this can, for
+            instance, be achieved with the help of ordinalencoder.
+
+        y : array-like of shape (n_samples,)
+            target values.
+
+        classes : array-like of shape (n_classes,), default=none
+            list of all the classes that can possibly appear in the y vector.
+
+            must be provided at the first call to partial_fit, can be omitted
+            in subsequent calls.
+
+        sample_weight : array-like of shape (n_samples,), default=none
+            weights applied to individual samples (1. for unweighted).
+
+        returns
+        -------
+        self : object
+            returns the instance itself.
+        """
+        return super().partial_fit(x, y, classes, sample_weight=sample_weight)
+
+    def _more_tags(self):
+        return {"requires_positive_x": true}
+
+    def _check_x(self, x):
+        """validate x, used only in predict* methods."""
+        x = self._validate_data(
+            x, dtype="int", accept_sparse=false, force_all_finite=true, reset=false
+        )
+        check_non_negative(x, "categoricalnb (input x)")
+        return x
+
+    def _check_x_y(self, x, y, reset=true):
+        x, y = self._validate_data(
+            x, y, dtype="int", accept_sparse=false, force_all_finite=true, reset=reset
+        )
+        check_non_negative(x, "categoricalnb (input x)")
+        return x, y
+
+    def _init_counters(self, n_classes, n_features):
+        self.class_count_ = np.zeros(n_classes, dtype=np.float64)
+        self.category_count_ = [np.zeros((n_classes, 0)) for _ in range(n_features)]
+
+    @staticmethod
+    def _validate_n_categories(x, min_categories):
+        # rely on max for n_categories categories are encoded between 0...n-1
+        n_categories_x = x.max(axis=0) + 1
+        min_categories_ = np.array(min_categories)
+        if min_categories is not none:
+            if not np.issubdtype(min_categories_.dtype, np.signedinteger):
+                raise valueerror(
+                    "'min_categories' should have integral type. got "
+                    f"{min_categories_.dtype} instead."
+                )
+            n_categories_ = np.maximum(n_categories_x, min_categories_, dtype=np.int64)
+            if n_categories_.shape != n_categories_x.shape:
+                raise valueerror(
+                    f"'min_categories' should have shape ({x.shape[1]},"
+                    ") when an array-like is provided. got"
+                    f" {min_categories_.shape} instead."
+                )
+            return n_categories_
+        else:
+            return n_categories_x
+
+    def _count(self, x, y):
+        def _update_cat_count_dims(cat_count, highest_feature):
+            diff = highest_feature + 1 - cat_count.shape[1]
+            if diff > 0:
+                # we append a column full of zeros for each new category
+                return np.pad(cat_count, [(0, 0), (0, diff)], "constant")
+            return cat_count
+
+        def _update_cat_count(x_feature, y, cat_count, n_classes):
+            for j in range(n_classes):
+                mask = y[:, j].astype(bool)
+                if y.dtype.type == np.int64:
+                    weights = none
+                else:
+                    weights = y[mask, j]
+                counts = np.bincount(x_feature[mask], weights=weights)
+                indices = np.nonzero(counts)[0]
+                cat_count[j, indices] += counts[indices]
+
+        self.class_count_ += y.sum(axis=0)
+        self.n_categories_ = self._validate_n_categories(x, self.min_categories)
+        for i in range(self.n_features_in_):
+            x_feature = x[:, i]
+            self.category_count_[i] = _update_cat_count_dims(
+                self.category_count_[i], self.n_categories_[i] - 1
+            )
+            _update_cat_count(
+                x_feature, y, self.category_count_[i], self.class_count_.shape[0]
+            )
+
+    def _update_feature_log_prob(self, alpha):
+        feature_log_prob = []
+        for i in range(self.n_features_in_):
+            smoothed_cat_count = self.category_count_[i] + alpha
+            smoothed_class_count = smoothed_cat_count.sum(axis=1)
+            feature_log_prob.append(
+                np.log(smoothed_cat_count) - np.log(smoothed_class_count.reshape(-1, 1))
+            )
+        self.feature_log_prob_ = feature_log_prob
+
+    def _joint_log_likelihood(self, x):
+        self._check_n_features(x, reset=false)
+        jll = np.zeros((x.shape[0], self.class_count_.shape[0]))
+        for i in range(self.n_features_in_):
+            indices = x[:, i]
+            jll += self.feature_log_prob_[i][:, indices].t
+        total_ll = jll + self.class_log_prior_
+        return total_ll
